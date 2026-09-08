@@ -2,6 +2,36 @@
 
 上海大学（SHU）统一身份认证 SSO 登录 POC —— 一次登录，向 3 个业务系统分别换取授权并验证登录。
 
+## 项目结构
+
+```
+poc.py          # CLI 入口（参数解析、模式选择、分发）
+src/config.py   # 协议常量（端点、RSA 公钥、企微参数、目标系统）
+src/utils.py    # 工具函数（RSA 加密、base64url、脱敏、日志）
+src/client.py   # ShuSSO HTTP 客户端
+src/flows.py    # 高层登录流程（密码 / 企微扫码、批量登录、汇总）
+```
+
+核心逻辑全部位于 `src/` 下，`poc.py` 仅负责命令行入口。
+
+## RSA 公钥自动更新
+
+登录时的密码加密用的是 newsso 前端 bundle 里的 RSA 公钥（`src/config.py` 中的 `RSA_PUBLIC_KEY_PEM`）。该公钥硬编码在登录 chunk
+`/p__oauth2__login__index.<hash>.async.js` 里（经 `setPublicKey(Pe)` 传给 JSEncrypt），前端每次重新打包会改变 hash，因此公钥可能随部署变化。
+
+`config.py` 在你**导入时自动抓取最新公钥**，按以下优先级取值：
+
+1. **线上抓取**：`GET /oauth2/login/` → 解析 `preload_helper|umi` 清单 → 找到 `p__oauth2__login__index.<hash>.async.js` → 正则提取 `-----BEGIN PUBLIC KEY----- ... END-----`
+2. **本地缓存**：抓取成功后写入项目目录 `.rsa_public_key.pem`，下次导入直接复用（不重复联网）
+3. **内置回退**：联网失败时使用硬编码的 `RSA_PUBLIC_KEY_PEM_FALLBACK`
+
+也可手动调用：
+
+```python
+from src.config import fetch_rsa_public_key_pem
+pem = fetch_rsa_public_key_pem()   # 命中返回最新 PEM，失败返回 None
+```
+
 ## 协议
 
 OAuth 2.0 授权码模式（RFC 6749），**非 OIDC**。
@@ -18,11 +48,11 @@ OAuth 2.0 授权码模式（RFC 6749），**非 OIDC**。
 
 ```bash
 pip install requests cryptography
-python shu_sso_verify.py                          # 交互式选择登录方式
-python shu_sso_verify.py --login password         # 账号密码登录
-python shu_sso_verify.py --login wecom_scan       # 企业微信扫码登录
-python shu_sso_verify.py --method sms             # 账号密码登录时指定 2FA 方式
-python shu_sso_verify.py --scan-timeout 300       # 扫码等待秒数（默认 180）
+python poc.py                          # 交互式选择登录方式
+python poc.py --login password         # 账号密码登录
+python poc.py --login wecom_scan       # 企业微信扫码登录
+python poc.py --method sms             # 账号密码登录时指定 2FA 方式
+python poc.py --scan-timeout 300       # 扫码等待秒数（默认 180）
 ```
 
 启动后先选择登录方式：
