@@ -31,6 +31,7 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
 import warnings
 from datetime import datetime
@@ -74,6 +75,9 @@ WECOM = {
     "qrcode_base": "https://open.work.weixin.qq.com/wwopen/sso/qrConnect",
     "img_base": "https://open.work.weixin.qq.com/wwopen/sso/qrImg",
     "confirm_base": "https://open.work.weixin.qq.com/wwopen/sso/confirm2",
+    # 扫码状态长轮询（Chrome DevTools 抓包确认；也见 qrConnect 页面的
+    # window.settings.longPollGetUrl，值为 /wwopen/sso/l/qrConnect）
+    "longpoll": "https://open.work.weixin.qq.com/wwopen/sso/l/qrConnect",
     # 企微客户端协议：在企微内拉起内置浏览器打开指定 URL。
     # 来源：企微官方 confirm2 页面内联脚本 launchWWByScheme()，原文为
     #   launchWWByScheme("wxwork://sso/jump?url=" + encodeURIComponent(confirm2_url))
@@ -355,6 +359,96 @@ class ShuSSO:
         self._record("wecom_qrcode", result)
         return result
 
+    # ---- 8. 企业微信扫码登录：长轮询等 auth_code --------------------
+    # 原理（用 Chrome DevTools 抓包 + 读 qrConnect 页面 window.settings 确认）：
+    #   qrConnect 页面暴露 longPollGetUrl = /wwopen/sso/l/qrConnect，
+    #   浏览器对它发起 GET 长轮询，返回 JSONP：
+    #     jsonpCallback({"status":"QRCODE_SCAN_NEVER","auth_code":""})
+    #   状态机（实测捕获）：
+    #     QRCODE_SCAN_NEVER  未扫码
+    #     QRCODE_SCAN_ING    已扫、待手机确认
+    #     QRCODE_SCAN_SUCC   已确认 → auth_code 有值
+    #     QRCODE_SCAN_ERR    二维码过期
+    #   拿到 auth_code 后 GET /oauth/wecom/qrcode?code=<auth_code>&state=<paramsBase64>
+    #   即可换取 SHU_OAUTH2 会话。
+    def wecom_wait_scan(self, key: str, state: str = "", timeout: int = 180,
+                        poll_log=None) -> dict:
+        deadline = time.time() + timeout
+        last_status = None
+        # 长轮询属于 open.work.weixin.qq.com，需用该域的 Referer/Origin，
+        # 否则可能被拒（ShuSSO 会话默认头指向 newsso）。
+        hdrs = {
+            "Referer": WECOM["qrcode_base"],
+            "Origin": "https://open.work.weixin.qq.com",
+            "x-requested-with": "XMLHttpRequest",
+            "Accept": "text/javascript, application/javascript, application/ecmascript, */*; q=0.01",
+        }
+        while time.time() < deadline:
+            try:
+                r = self.sess.get(WECOM["longpoll"], params={
+                    "callback": "jsonpCallback",
+                    "key": key,
+                    "redirect_uri": WECOM["redirect_uri"],
+                    "appid": WECOM["appid"],
+                    "_": int(time.time() * 1000),
+                }, headers=hdrs, timeout=40)
+            except requests.exceptions.Timeout:
+                continue
+            except Exception:
+                time.sleep(1)
+                continue
+
+            m = re.search(r"jsonpCallback\((\{.*?\})\)", r.text or "", re.S)
+            if not m:
+                continue
+            try:
+                data = json.loads(m.group(1))
+            except Exception:
+                continue
+
+            status = data.get("status")
+            if status != last_status:
+                if poll_log:
+                    poll_log(status, data.get("auth_code") or "")
+                last_status = status
+
+            if status == "QRCODE_SCAN_SUCC" and data.get("auth_code"):
+                out = {"ok": True, "status": status,
+                       "auth_code": data["auth_code"]}
+                self._record("wecom_wait_scan", out)
+                return out
+            if status in ("QRCODE_SCAN_ERR", "QRCODE_SCAN_OVERDUE",
+                          "QRCODE_SCAN_CANCEL"):
+                out = {"ok": False, "status": status, "reason": "qrcode_expired_or_cancelled"}
+                self._record("wecom_wait_scan", out)
+                return out
+            if status == "QRCODE_SCAN_ING":
+                time.sleep(0.5)
+
+        out = {"ok": False, "status": last_status, "reason": "timeout"}
+        self._record("wecom_wait_scan", out)
+        return out
+
+    # ---- 9. 企业微信扫码登录：用 auth_code 换 SSO 会话 -------------
+    # 注意：回调除 code/state 外还**必须带 appid**（DevTools 抓浏览器实际请求确认），
+    #       缺 appid 会返回 {"message":"badRequestParams"}。
+    def wecom_redeem(self, auth_code: str, state: str) -> dict:
+        r = self.sess.get(WECOM["redirect_uri"],
+                          params={"code": auth_code, "state": state,
+                                  "appid": WECOM["appid"]},
+                          allow_redirects=False, timeout=self.timeout)
+        loc = r.headers.get("Location", "") or ""
+        ok = "message=wecomAuthFailed" not in loc and "badRequestParams" not in (r.text or "")
+        result = {
+            "ok": ok,
+            "http_status": r.status_code,
+            "location": loc,
+            "cookies": [c.name for c in self.sess.cookies],
+            "body": (r.text or "")[:300],
+        }
+        self._record("wecom_redeem", result)
+        return result
+
 
 # --------------------------------------------------------------------------
 # 主流程
@@ -379,22 +473,89 @@ def choose_login_mode(args) -> str:
         return args.login
     print("\n请选择登录方式：")
     print("  [1] 账号密码登录（学号/工号 + 密码 + 两步验证）")
-    print("  [2] 企业微信扫码登录（仅生成二维码与唤起链接）")
+    print("  [2] 企业微信扫码登录（扫码确认后自动登录 3 个系统）")
     choice = input("输入 1 或 2 [默认 1]: ").strip() or "1"
     return "wecom_scan" if choice == "2" else "password"
 
 
-def wecom_scan_flow(args) -> int:
-    """企业微信扫码登录：生成并展示本次会话的二维码 URL 与包装后的唤起链接。
+def login_all_systems(client: ShuSSO) -> dict[str, dict]:
+    """用已建立的 SSO 会话，依次向 3 个业务系统换取授权并登录。
 
-    说明：企微官方 SDK（WwLogin）在前端把 qrConnect 页面嵌进 iframe，
-    扫码成功后由 iframe 通过 postMessage 把跳转地址回传给浏览器。
-    纯 HTTP 客户端无法接收该 postMessage，因此本流程只负责生成链接，
-    不在脚本内等待/感知扫码结果。
+    返回 {system_key: redeem 结果}。
+    """
+    log(f"\n[OAuth ①③④] 用同一 SSO 会话依次登录 {len(SYSTEMS)} 个系统...\n")
+    results: dict[str, dict] = {}
+
+    for key, cfg in SYSTEMS.items():
+        log(f"  ── {cfg['name']} ({key}) ──")
+
+        state = ""
+        if cfg.get("needs_state_bootstrap"):
+            state = client.bootstrap_state(cfg["needs_state_bootstrap"]) or ""
+            log(f"     [OAuth ①] 预热 state: {mask(state, 8)}")
+        elif cfg.get("generate_state"):
+            # jwxt 的授权请求不带 state，自行生成随机 UUID 作为防 CSRF 值
+            state = uuid.uuid4().hex
+            log(f"     [OAuth ①] 生成 state: {mask(state, 8)}")
+
+        auth = client.authorize(cfg["client_id"], cfg["redirect_uri"],
+                                cfg.get("scope", ""), state)
+
+        if auth["needs_login"]:
+            log("     ✗ 需要重新登录（会话未复用）")
+            results[key] = {"logged_in": False, "reason": "session_not_reused",
+                            "authorize": auth}
+            continue
+
+        if not auth["location"]:
+            log("     ✗ 未取得重定向地址")
+            results[key] = {"logged_in": False, "reason": "no_redirect",
+                            "authorize": auth}
+            continue
+
+        log(f"     [OAuth ③] HTTP {auth['http_status']} → 取到 code: {mask(auth['code'] or '', 8)}")
+        red = client.redeem(key, auth["location"])
+        results[key] = red
+
+        if red["logged_in"]:
+            log(f"     [OAuth ④] ✓ 登录成功 → {red['final_url'][:70]}")
+        else:
+            log(f"     [OAuth ④] ✗ 登录失败 → {red['final_url'][:70]}")
+        print()
+
+    return results
+
+
+def print_summary(results: dict[str, dict]) -> int:
+    """打印汇总，返回成功系统数。"""
+    log("=" * 62)
+    log(" 验证结果汇总")
+    log("=" * 62)
+    ok = 0
+    for key, cfg in SYSTEMS.items():
+        r = results.get(key, {})
+        status = "✓ 成功" if r.get("logged_in") else "✗ 失败"
+        log(f"  {status}  {cfg['name']:<18} {(r.get('final_url') or '')[:42]}")
+        if r.get("logged_in"):
+            ok += 1
+    log("=" * 62)
+    log(f"  合计：{ok}/{len(SYSTEMS)} 个系统登录成功")
+    return ok
+
+
+def wecom_scan_flow(args) -> int:
+    """企业微信扫码登录：生成二维码 → 长轮询等 auth_code → 换 SSO 会话 → 登录 3 个系统。
+
+    机制（用 Chrome DevTools 抓包确认）：
+      1. qrConnect 页面内嵌 qrImg?key=<key>，key 即本次扫码会话标识；
+      2. 页面同时对 /wwopen/sso/l/qrConnect 发起 JSONP 长轮询，
+         返回 {"status":"QRCODE_SCAN_XXX","auth_code":"..."}；
+      3. 状态到 QRCODE_SCAN_SUCC 时 auth_code 有值；
+      4. GET /oauth/wecom/qrcode?code=<auth_code>&state=<paramsBase64> 换 SSO 会话。
     """
     client = ShuSSO(tenant=args.tenant)
 
-    # state 沿用首个系统的授权参数，便于扫码后由 newsso 侧完成后续跳转
+    # state = paramsBase64（newsso 前端 WwLogin({state:n})，n 即 paramsBase64）
     first = SYSTEMS["jwxt"]
     state = b64_params({
         "responseType": "code",
@@ -414,11 +575,11 @@ def wecom_scan_flow(args) -> int:
                   {"response": info, "trace": client.trace})
         return 6
 
-    log(f"  ✓ 二维码已生成（key: {mask(info['key'], 8)}）")
-
     line = "─" * 62
     print()
     print(line)
+    print(" 请用企业微信扫描下面的二维码并在手机上点「确认登录」")
+    print()
     print(" ① 二维码图片 URL（浏览器打开即可扫码）")
     print(f"    {info['qr_img_url']}")
     print()
@@ -428,8 +589,40 @@ def wecom_scan_flow(args) -> int:
     print(" ③ 包装后的 URI 跳转（在企微内直接打开该确认页）")
     print(f"    {info['wxwork_scheme']}")
     print(line)
-    print(" 提示：③ 在浏览器地址栏 / 短信 / 聊天窗口里点开，即可拉起企业微信")
-    print("       并在内置浏览器中完成本次确认；脚本侧不等待扫码结果。")
+    print(f" 等待扫码确认（最多 {args.scan_timeout} 秒，Ctrl+C 可中断）...")
+
+    def _on_status(status, auth_code):
+        shown = {
+            "QRCODE_SCAN_NEVER": "等待扫码",
+            "QRCODE_SCAN_ING": "已扫码，请在手机上确认",
+            "QRCODE_SCAN_SUCC": "已确认，正在换取会话",
+            "QRCODE_SCAN_ERR": "二维码已过期",
+        }.get(status, status)
+        log(f"     {shown}")
+
+    wait = client.wecom_wait_scan(info["key"], state=state,
+                                  timeout=args.scan_timeout, poll_log=_on_status)
+
+    if not wait.get("ok"):
+        log(f"  ✗ 未取得 auth_code（{wait.get('reason') or wait.get('status')}）")
+        save_json("script-00-wecom-scan-failed.json",
+                  {"wait": wait, "wecom_qrcode": info, "trace": client.trace})
+        return 7
+
+    log("  ✓ 已取得 auth_code，换取 SSO 会话 ...")
+    red = client.wecom_redeem(wait["auth_code"], state)
+    if not red["ok"]:
+        log(f"  ✗ 换取会话失败（HTTP {red['http_status']}）")
+        save_json("script-00-wecom-redeem-failed.json",
+                  {"redeem": red, "trace": client.trace})
+        return 8
+
+    log(f"  ✓ SSO 会话已建立（Cookie: SHU_OAUTH2）")
+    log(f"     → {red['location'][:90]}")
+
+    # ---------- 用同一会话依次登录 3 个系统 ----------
+    results = login_all_systems(client)
+    ok = print_summary(results)
 
     path = save_json("script-wecom-scan.json", {
         "timestamp": datetime.now().isoformat(),
@@ -437,10 +630,15 @@ def wecom_scan_flow(args) -> int:
         "mode": "wecom_scan",
         "state": state,
         "wecom_qrcode": info,
+        "wait": wait,
+        "redeem": red,
+        "summary": {k: {"logged_in": v.get("logged_in"),
+                        "final_url": v.get("final_url")} for k, v in results.items()},
+        "details": results,
         "trace": client.trace,
     })
     log(f"\n证据已保存: {path}")
-    return 0
+    return 0 if ok == len(SYSTEMS) else 5
 
 
 def main() -> int:
@@ -450,6 +648,8 @@ def main() -> int:
                         help="登录方式（省略则交互选择）")
     parser.add_argument("--method", choices=["wecom", "sms"],
                         help="账号密码登录时的 2FA 方式（省略则交互选择）")
+    parser.add_argument("--scan-timeout", type=int, default=180,
+                        help="企微扫码等待秒数（默认 180）")
     args = parser.parse_args()
 
     banner()
@@ -563,60 +763,9 @@ def main() -> int:
             log(f"\n[企微扫码] 未能解析出 key（HTTP {wecom.get('http_status')}）")
 
     # ---------- 第 3 步：逐个系统换授权 ----------
-    log(f"\n[OAuth ①③④] 用同一 SSO 会话依次登录 {len(SYSTEMS)} 个系统...\n")
-    results: dict[str, dict] = {}
+    results = login_all_systems(client)
+    ok = print_summary(results)
 
-    for key, cfg in SYSTEMS.items():
-        log(f"  ── {cfg['name']} ({key}) ──")
-
-        state = ""
-        if cfg.get("needs_state_bootstrap"):
-            state = client.bootstrap_state(cfg["needs_state_bootstrap"]) or ""
-            log(f"     [OAuth ①] 预热 state: {mask(state, 8)}")
-        elif cfg.get("generate_state"):
-            # jwxt 的授权请求不带 state，自行生成随机 UUID 作为防 CSRF 值
-            state = uuid.uuid4().hex
-            log(f"     [OAuth ①] 生成 state: {mask(state, 8)}")
-
-        auth = client.authorize(cfg["client_id"], cfg["redirect_uri"],
-                                cfg.get("scope", ""), state)
-
-        if auth["needs_login"]:
-            log("     ✗ 需要重新登录（会话未复用）")
-            results[key] = {"logged_in": False, "reason": "session_not_reused",
-                            "authorize": auth}
-            continue
-
-        if not auth["location"]:
-            log("     ✗ 未取得重定向地址")
-            results[key] = {"logged_in": False, "reason": "no_redirect",
-                            "authorize": auth}
-            continue
-
-        log(f"     [OAuth ③] HTTP {auth['http_status']} → 取到 code: {mask(auth['code'] or '', 8)}")
-        red = client.redeem(key, auth["location"])
-        results[key] = red
-
-        if red["logged_in"]:
-            log(f"     [OAuth ④] ✓ 登录成功 → {red['final_url'][:70]}")
-        else:
-            log(f"     [OAuth ④] ✗ 登录失败 → {red['final_url'][:70]}")
-        print()
-
-    # ---------- 汇总 ----------
-    log("\n" + "=" * 62)
-    log(" 验证结果汇总")
-    log("=" * 62)
-    ok = 0
-    for key, cfg in SYSTEMS.items():
-        r = results.get(key, {})
-        status = "✓ 成功" if r.get("logged_in") else "✗ 失败"
-        final = (r.get("final_url") or "")[:42]
-        log(f"  {status}  {cfg['name']:<18} {final}")
-        if r.get("logged_in"):
-            ok += 1
-    log("=" * 62)
-    log(f"  合计：{ok}/{len(SYSTEMS)} 个系统登录成功")
     log("")
     log("  结论：授权码一次性、绑定 state，不可复用；")
     log("        SHU_OAUTH2 会话 Cookie 在 newsso 域内可被多系统复用（OAuth 2.0，非 OIDC）。")
