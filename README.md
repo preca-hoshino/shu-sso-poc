@@ -33,6 +33,24 @@ python shu_sso_verify.py --method wecom   # 指定 2FA 方式
 
 每个系统 state 策略不同：`jwxt` 自生成随机 state；`otp`、`bbs` 需先访问自身入口预取 state（OTP 回调还依赖 `Refresh` 头跳转）。
 
+## 企业微信扫码确认 URL
+
+脚本登录成功后，会通过纯 HTTP 请求（无需扫码）还原出「企业微信扫码后打开的确认页地址」：
+
+```text
+https://open.work.weixin.qq.com/wwopen/sso/confirm2?k=<key>&notretry=yes
+```
+
+原理：
+
+1. newsso 前端用企微官方 `WwLogin` SDK 在 `#ww_login_container` 里渲染一个 iframe，src 指向企微 `qrConnect` 页面。
+2. `qrConnect` 页面直接返回 HTML，其中内嵌 `qrImg?key=<hex>`（key 为企微扫码会话标识）。
+3. 解码该二维码 PNG，其内容就是 `confirm2?k=<同一个key>&notretry=yes`。
+
+因此脚本通过 `wecom_qrcode_info()` 请求 `qrConnect` 并解析出 `key`，即可拼出扫码后确认 URL，完全避开扫码步骤。
+
+企微参数（`appid` / `agentid` / `redirect_uri`）硬编码在脚本的 `WECOM` 常量中，来自 newsso 前端 bundle。
+
 ## 安全
 
 - 密码经 `getpass` 读取，**不落盘、不打印、不写日志**

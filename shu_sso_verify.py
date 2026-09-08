@@ -29,6 +29,7 @@ import base64
 import getpass
 import json
 import os
+import re
 import sys
 import uuid
 import warnings
@@ -63,6 +64,17 @@ wTBNePOk1H+LRQokgQIDAQAB
 -----END PUBLIC KEY-----"""
 
 DEFAULT_TENANT = "上海大学"
+
+# 企业微信扫码登录参数（来自 newsso 前端 bundle，硬编码）
+# 说明：newsso 前端用企微官方 WwLogin SDK 渲染二维码，参数是硬编码的。
+WECOM = {
+    "appid": "wxa8dea949443de641",                       # 上海大学企微应用 appid
+    "agentid": "1000059",                                # 企微自建应用 agentid
+    "redirect_uri": "https://newsso.shu.edu.cn/oauth/wecom/qrcode",  # 扫码回调
+    "qrcode_base": "https://open.work.weixin.qq.com/wwopen/sso/qrConnect",
+    "img_base": "https://open.work.weixin.qq.com/wwopen/sso/qrImg",
+    "confirm_base": "https://open.work.weixin.qq.com/wwopen/sso/confirm2",
+}
 
 # 三个目标系统（client 注册信息已实测确认）
 SYSTEMS = {
@@ -296,6 +308,38 @@ class ShuSSO:
         self._record("bootstrap_state", {"url": url, "location": loc, "state": state})
         return state
 
+    # ---- 7. 企业微信：拿到「扫码后打开的确认 URL」 -----------------
+    # 原理：newsso 前端用企微官方 WwLogin SDK 渲染二维码。
+    #       qrConnect 页面直接返回 HTML，其中内嵌 `qrImg?key=<hex>`；
+    #       解码该二维码，其内容就是 `confirm2?k=<同一个key>&notretry=yes`。
+    #       因此无需扫码，仅凭 HTTP 请求即可还原出扫码后 URL。
+    def wecom_qrcode_info(self, state: str = "") -> dict:
+        q = {
+            "appid": WECOM["appid"],
+            "agentid": WECOM["agentid"],
+            "redirect_uri": WECOM["redirect_uri"],
+            "state": state,
+            "lang": "zh",
+            "version": "1.2.7",
+            "login_type": "jssdk",
+        }
+        r = self.sess.get(WECOM["qrcode_base"], params=q, timeout=self.timeout)
+        html = r.text or ""
+
+        # 提取 key：qrImg?key=<hex>
+        m = re.search(r"qrImg\?key=([0-9a-fA-F]+)", html)
+        key = m.group(1) if m else None
+
+        result = {
+            "qrConnect_url": r.url,
+            "http_status": r.status_code,
+            "key": key,
+            "qrImg_url": f"{WECOM['img_base']}?key={key}" if key else None,
+            "confirm_url": f"{WECOM['confirm_base']}?k={key}&notretry=yes" if key else None,
+        }
+        self._record("wecom_qrcode", result)
+        return result
+
 
 # --------------------------------------------------------------------------
 # 主流程
@@ -411,6 +455,16 @@ def main() -> int:
 
     log("  ✓ 已建立 SSO 会话 Cookie: SHU_OAUTH2（newsso 域可跨系统复用）")
 
+    # ---------- 企业微信扫码确认 URL ----------
+    # 无需扫码，直接从 qrConnect 页面解析出 key，还原出「扫码后打开的确认页」地址
+    wecom = client.wecom_qrcode_info(state=login_params)
+    if wecom.get("key"):
+        log(f"\n[企微扫码] 无需扫码即可还原确认地址：")
+        log(f"     key : {mask(wecom['key'], 8)}")
+        log(f"     url : {wecom['confirm_url']}")
+    else:
+        log(f"\n[企微扫码] 未能解析出 key（HTTP {wecom.get('http_status')}）")
+
     # ---------- 第 3 步：逐个系统换授权 ----------
     log(f"\n[OAuth ①③④] 用同一 SSO 会话依次登录 {len(SYSTEMS)} 个系统...\n")
     results: dict[str, dict] = {}
@@ -478,6 +532,7 @@ def main() -> int:
         "two_factor_method": method,
         "protocol": "OAuth 2.0 Authorization Code (RFC 6749), NOT OIDC",
         "sso_session_cookie": "SHU_OAUTH2",
+        "wecom_qrcode": wecom,
         "summary": {k: {"logged_in": v.get("logged_in"),
                         "final_url": v.get("final_url")} for k, v in results.items()},
         "details": results,
