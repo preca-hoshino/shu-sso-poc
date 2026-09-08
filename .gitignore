@@ -10,6 +10,9 @@ venv/
 # 运行产物（含脱敏证据）
 captures/
 
+# 本地逆向分析用的前端 bundle（从服务器下载的 JS）
+_analysis_bundle/
+
 # OS
 .DS_Store
 Thumbs.db
