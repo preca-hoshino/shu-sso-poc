@@ -35,7 +35,7 @@ import uuid
 import warnings
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import requests
 from cryptography.hazmat.primitives import serialization
@@ -74,6 +74,11 @@ WECOM = {
     "qrcode_base": "https://open.work.weixin.qq.com/wwopen/sso/qrConnect",
     "img_base": "https://open.work.weixin.qq.com/wwopen/sso/qrImg",
     "confirm_base": "https://open.work.weixin.qq.com/wwopen/sso/confirm2",
+    # 企微客户端协议：在企微内拉起内置浏览器打开指定 URL。
+    # 来源：企微官方 confirm2 页面内联脚本 launchWWByScheme()，原文为
+    #   launchWWByScheme("wxwork://sso/jump?url=" + encodeURIComponent(confirm2_url))
+    # 即：<scheme_jump_base><urlencode(目标URL)>
+    "scheme_jump_base": "wxwork://sso/jump?url=",
 }
 
 # 三个目标系统（client 注册信息已实测确认）
@@ -313,6 +318,12 @@ class ShuSSO:
     #       qrConnect 页面直接返回 HTML，其中内嵌 `qrImg?key=<hex>`；
     #       解码该二维码，其内容就是 `confirm2?k=<同一个key>&notretry=yes`。
     #       因此无需扫码，仅凭 HTTP 请求即可还原出扫码后 URL。
+    #
+    #       进一步：企微官方 confirm2 页面自身就是靠 scheme 唤起客户端的，
+    #       其内联脚本原文为：
+    #         launchWWByScheme("wxwork://sso/jump?url=" + encodeURIComponent(confirm2_url))
+    #       所以把 confirm2 URL 包进 `wxwork://sso/jump?url=` 即得到
+    #       「一键在企业微信内部打开确认页」的链接。
     def wecom_qrcode_info(self, state: str = "") -> dict:
         q = {
             "appid": WECOM["appid"],
@@ -330,12 +341,16 @@ class ShuSSO:
         m = re.search(r"qrImg\?key=([0-9a-fA-F]+)", html)
         key = m.group(1) if m else None
 
+        confirm_url = f"{WECOM['confirm_base']}?k={key}&notretry=yes" if key else None
         result = {
             "qrConnect_url": r.url,
             "http_status": r.status_code,
             "key": key,
             "qrImg_url": f"{WECOM['img_base']}?key={key}" if key else None,
-            "confirm_url": f"{WECOM['confirm_base']}?k={key}&notretry=yes" if key else None,
+            "confirm_url": confirm_url,
+            # 企业微信客户端内直接打开的 scheme（外部浏览器/短信里点击可拉起企微）
+            "wxwork_scheme": (WECOM["scheme_jump_base"]
+                              + quote(confirm_url, safe="")) if confirm_url else None,
         }
         self._record("wecom_qrcode", result)
         return result
@@ -462,6 +477,8 @@ def main() -> int:
         log(f"\n[企微扫码] 无需扫码即可还原确认地址：")
         log(f"     key : {mask(wecom['key'], 8)}")
         log(f"     url : {wecom['confirm_url']}")
+        log(f"     企微内直接打开（scheme）：")
+        log(f"     {wecom['wxwork_scheme']}")
     else:
         log(f"\n[企微扫码] 未能解析出 key（HTTP {wecom.get('http_status')}）")
 

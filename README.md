@@ -51,6 +51,41 @@ https://open.work.weixin.qq.com/wwopen/sso/confirm2?k=<key>&notretry=yes
 
 企微参数（`appid` / `agentid` / `redirect_uri`）硬编码在脚本的 `WECOM` 常量中，来自 newsso 前端 bundle。
 
+### 一键在企业微信内打开（scheme）
+
+上面那个 `confirm2` 地址是**网页**，在电脑浏览器里打开只会显示「正在跳转到企业微信…」。要真正触发确认，需要让它在**企业微信客户端内置浏览器**里打开。
+
+企微官方 `confirm2` 页面本身就是这么做的——它的内联脚本里有：
+
+```js
+launchWWByScheme("wxwork://sso/jump?url=" + encodeURIComponent(
+  "https://open.work.weixin.qq.com/wwopen/sso/confirm2?k=<key>"
+), function (isOk) { WeixinJSBridge.invoke('closeWindow'); })
+```
+
+所以只需把 `confirm2` 地址包一层 `wxwork://sso/jump?url=`（URL 编码），脚本会直接输出这个链接：
+
+```text
+wxwork://sso/jump?url=https%3A%2F%2Fopen.work.weixin.qq.com%2Fwwopen%2Fsso%2Fconfirm2%3Fk%3D<key>%26notretry%3Dyes
+```
+
+在浏览器地址栏（或短信、聊天窗口里）点开它即可拉起企业微信并跳进内置浏览器完成确认。相关常量与字段：
+
+| 位置 | 值 |
+| --- | --- |
+| `WECOM["scheme_jump_base"]` | `wxwork://sso/jump?url=` |
+| 返回值 `wxwork_scheme` | 完整 scheme 链接 |
+
+其他已知的 `wxwork://` 协议（备查，均非本流程所需）：
+
+| 用途 | Scheme |
+| --- | --- |
+| 唤起企微（仅拉起 App） | `wxwork://` |
+| 内置浏览器打开指定 URL | `wxwork://sso/jump?url=<urlencode(url)>` |
+| webview 型模板内跳转（官方文档） | `wxwork://openurl?url=<urlencode(url)>` |
+| 扫一扫 | `wxwork://platformId=wechat&wwact=qrcode` |
+| 打开个人聊天窗口 | `wxwork://launch?launch_code=xxx` |
+
 ## 安全
 
 - 密码经 `getpass` 读取，**不落盘、不打印、不写日志**
