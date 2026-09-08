@@ -17,11 +17,31 @@ OAuth 2.0 授权码模式（RFC 6749），**非 OIDC**。
 
 ```bash
 pip install requests cryptography
-python shu_sso_verify.py               # 交互式
-python shu_sso_verify.py --method wecom   # 指定 2FA 方式
+python shu_sso_verify.py                          # 交互式选择登录方式
+python shu_sso_verify.py --login password         # 账号密码登录
+python shu_sso_verify.py --login wecom_scan       # 企业微信扫码（仅生成链接）
+python shu_sso_verify.py --method sms             # 账号密码登录时指定 2FA 方式
 ```
 
-交互流程：输入学号 → 输入密码（不回显）→ 选择 2FA（1 企业微信 / 2 短信）→ 输入验证码 → 自动登录 3 个系统并输出结果。
+启动后先选择登录方式：
+
+| 选项 | 模式 | 说明 |
+| --- | --- | --- |
+| `[1]` | `password` | 学号/工号 + 密码 + 两步验证（企业微信/短信），登录后自动跑通 3 个业务系统 |
+| `[2]` | `wecom_scan` | 仅生成并展示本次会话的企微二维码 URL 与包装后的 URI 跳转，不做登录 |
+
+**账号密码模式**交互流程：输入学号 → 输入密码（不回显）→ 选择 2FA（1 企业微信 / 2 短信）→ 输入验证码 → 自动登录 3 个系统并输出结果。
+
+**企微扫码模式**直接输出三项：
+
+```text
+① 二维码图片 URL            https://open.work.weixin.qq.com/wwopen/sso/qrImg?key=<key>
+② 二维码内容（确认页）      https://open.work.weixin.qq.com/wwopen/sso/confirm2?k=<key>&notretry=yes
+③ 包装后的 URI 跳转         wxwork://sso/jump?url=<urlencode(②)>
+```
+
+> 注：企微官方 SDK 用 `postMessage` 把扫码结果回传给浏览器，纯 HTTP 客户端收不到，
+> 因此扫码模式只负责生成链接，不在脚本内等待扫码结果。
 
 ## 目标系统
 
@@ -35,7 +55,7 @@ python shu_sso_verify.py --method wecom   # 指定 2FA 方式
 
 ## 企业微信扫码确认 URL
 
-脚本登录成功后，会通过纯 HTTP 请求（无需扫码）还原出「企业微信扫码后打开的确认页地址」：
+无论哪种模式，都通过纯 HTTP 请求（**无需扫码**）还原出「企业微信扫码后打开的确认页地址」：
 
 ```text
 https://open.work.weixin.qq.com/wwopen/sso/confirm2?k=<key>&notretry=yes
@@ -50,6 +70,8 @@ https://open.work.weixin.qq.com/wwopen/sso/confirm2?k=<key>&notretry=yes
 因此脚本通过 `wecom_qrcode_info()` 请求 `qrConnect` 并解析出 `key`，即可拼出扫码后确认 URL，完全避开扫码步骤。
 
 企微参数（`appid` / `agentid` / `redirect_uri`）硬编码在脚本的 `WECOM` 常量中，来自 newsso 前端 bundle。
+
+> `wecom_scan` 模式下不需要学号密码即可直接输出；`password` 模式下若 2FA 选了企业微信，也会顺带打印。
 
 ### 一键在企业微信内打开（scheme）
 

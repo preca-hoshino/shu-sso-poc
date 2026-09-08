@@ -346,7 +346,7 @@ class ShuSSO:
             "qrConnect_url": r.url,
             "http_status": r.status_code,
             "key": key,
-            "qrImg_url": f"{WECOM['img_base']}?key={key}" if key else None,
+            "qr_img_url": f"{WECOM['img_base']}?key={key}" if key else None,
             "confirm_url": confirm_url,
             # 企业微信客户端内直接打开的 scheme（外部浏览器/短信里点击可拉起企微）
             "wxwork_scheme": (WECOM["scheme_jump_base"]
@@ -373,13 +373,92 @@ def banner() -> None:
     print("=" * 62)
 
 
+def choose_login_mode(args) -> str:
+    """选择登录方式：password（账号密码+2FA）或 wecom_scan（企微扫码）。"""
+    if args.login:
+        return args.login
+    print("\n请选择登录方式：")
+    print("  [1] 账号密码登录（学号/工号 + 密码 + 两步验证）")
+    print("  [2] 企业微信扫码登录（仅生成二维码与唤起链接）")
+    choice = input("输入 1 或 2 [默认 1]: ").strip() or "1"
+    return "wecom_scan" if choice == "2" else "password"
+
+
+def wecom_scan_flow(args) -> int:
+    """企业微信扫码登录：生成并展示本次会话的二维码 URL 与包装后的唤起链接。
+
+    说明：企微官方 SDK（WwLogin）在前端把 qrConnect 页面嵌进 iframe，
+    扫码成功后由 iframe 通过 postMessage 把跳转地址回传给浏览器。
+    纯 HTTP 客户端无法接收该 postMessage，因此本流程只负责生成链接，
+    不在脚本内等待/感知扫码结果。
+    """
+    client = ShuSSO(tenant=args.tenant)
+
+    # state 沿用首个系统的授权参数，便于扫码后由 newsso 侧完成后续跳转
+    first = SYSTEMS["jwxt"]
+    state = b64_params({
+        "responseType": "code",
+        "clientId": first["client_id"],
+        "clientName": first["name"],
+        "scope": first["scope"],
+        "redirectUri": first["redirect_uri"],
+        "state": "",
+    })
+
+    log("\n[企微扫码] 请求 qrConnect，生成本次会话二维码 ...")
+    info = client.wecom_qrcode_info(state=state)
+
+    if not info.get("key"):
+        log(f"  ✗ 未能解析出 key（HTTP {info.get('http_status')}）")
+        save_json("script-00-wecom-scan-failed.json",
+                  {"response": info, "trace": client.trace})
+        return 6
+
+    log(f"  ✓ 二维码已生成（key: {mask(info['key'], 8)}）")
+
+    line = "─" * 62
+    print()
+    print(line)
+    print(" ① 二维码图片 URL（浏览器打开即可扫码）")
+    print(f"    {info['qr_img_url']}")
+    print()
+    print(" ② 二维码内容 = 扫码后企微打开的确认页")
+    print(f"    {info['confirm_url']}")
+    print()
+    print(" ③ 包装后的 URI 跳转（在企微内直接打开该确认页）")
+    print(f"    {info['wxwork_scheme']}")
+    print(line)
+    print(" 提示：③ 在浏览器地址栏 / 短信 / 聊天窗口里点开，即可拉起企业微信")
+    print("       并在内置浏览器中完成本次确认；脚本侧不等待扫码结果。")
+
+    path = save_json("script-wecom-scan.json", {
+        "timestamp": datetime.now().isoformat(),
+        "tenant": args.tenant,
+        "mode": "wecom_scan",
+        "state": state,
+        "wecom_qrcode": info,
+        "trace": client.trace,
+    })
+    log(f"\n证据已保存: {path}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="上海大学 SSO 多系统登录验证")
     parser.add_argument("--tenant", default=DEFAULT_TENANT, help=f"院校（默认 {DEFAULT_TENANT}）")
-    parser.add_argument("--method", choices=["wecom", "sms"], help="2FA 方式（省略则交互选择）")
+    parser.add_argument("--login", choices=["password", "wecom_scan"],
+                        help="登录方式（省略则交互选择）")
+    parser.add_argument("--method", choices=["wecom", "sms"],
+                        help="账号密码登录时的 2FA 方式（省略则交互选择）")
     args = parser.parse_args()
 
     banner()
+
+    # ---------- 选择登录方式 ----------
+    mode = choose_login_mode(args)
+
+    if mode == "wecom_scan":
+        return wecom_scan_flow(args)
 
     # ---------- 收集凭据（本地终端输入，不经网络） ----------
     username = input("学号/工号: ").strip()
@@ -470,17 +549,18 @@ def main() -> int:
 
     log("  ✓ 已建立 SSO 会话 Cookie: SHU_OAUTH2（newsso 域可跨系统复用）")
 
-    # ---------- 企业微信扫码确认 URL ----------
+    # ---------- 企业微信扫码确认 URL（仅 2FA 走企微时展示） ----------
     # 无需扫码，直接从 qrConnect 页面解析出 key，还原出「扫码后打开的确认页」地址
-    wecom = client.wecom_qrcode_info(state=login_params)
-    if wecom.get("key"):
-        log(f"\n[企微扫码] 无需扫码即可还原确认地址：")
-        log(f"     key : {mask(wecom['key'], 8)}")
-        log(f"     url : {wecom['confirm_url']}")
-        log(f"     企微内直接打开（scheme）：")
-        log(f"     {wecom['wxwork_scheme']}")
-    else:
-        log(f"\n[企微扫码] 未能解析出 key（HTTP {wecom.get('http_status')}）")
+    wecom: dict = {}
+    if method == "wecom":
+        wecom = client.wecom_qrcode_info(state=login_params)
+        if wecom.get("key"):
+            log("\n[企微扫码] 本次会话的二维码与唤起链接：")
+            log(f"     二维码图片 : {wecom['qr_img_url']}")
+            log(f"     确认页地址 : {wecom['confirm_url']}")
+            log(f"     URI 跳转   : {wecom['wxwork_scheme']}")
+        else:
+            log(f"\n[企微扫码] 未能解析出 key（HTTP {wecom.get('http_status')}）")
 
     # ---------- 第 3 步：逐个系统换授权 ----------
     log(f"\n[OAuth ①③④] 用同一 SSO 会话依次登录 {len(SYSTEMS)} 个系统...\n")
