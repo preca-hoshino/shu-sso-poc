@@ -1,0 +1,15 @@
+# .gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行产物（含脱敏证据）
+captures/
+
+# OS
+.DS_Store
+Thumbs.db
