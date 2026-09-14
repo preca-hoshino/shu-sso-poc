@@ -12,7 +12,7 @@ from datetime import datetime
 
 from . import config
 from .client import ShuSSO
-from .utils import b64_params, log, mask, rsa_encrypt_password, save_json
+from .utils import b64_params, device_id_for, log, mask, rsa_encrypt_password, save_json
 
 
 def banner() -> None:
@@ -34,13 +34,16 @@ def choose_login_mode(args) -> str:
         return args.login
     print("\n请选择登录方式：")
     print("  [1] 账号密码登录（学号/工号 + 密码 + 两步验证）")
-    print("  [2] 企业微信扫码登录（扫码确认后自动登录 3 个系统）")
+    print("  [2] 企业微信扫码登录（扫码确认后自动登录全部系统）")
     choice = input("输入 1 或 2 [默认 1]: ").strip() or "1"
     return "wecom_scan" if choice == "2" else "password"
 
 
-def login_all_systems(client: ShuSSO) -> dict[str, dict]:
-    """用已建立的 SSO 会话，依次向 3 个业务系统换取授权并登录。
+def login_all_systems(client: ShuSSO, device_id: str = "") -> dict[str, dict]:
+    """用已建立的 SSO 会话，依次向各业务系统换取授权并登录。
+
+    绝大多数系统走「拿 code → 跟随 302 换会话」的通用路径；WebVPN 是例外，
+    它用私有接口换会话，见 _login_webvpn()。
 
     返回 {system_key: redeem 结果}。
     """
@@ -49,6 +52,11 @@ def login_all_systems(client: ShuSSO) -> dict[str, dict]:
 
     for key, cfg in config.SYSTEMS.items():
         log(f"  ── {cfg['name']} ({key}) ──")
+
+        if cfg.get("redeem_kind") == "webvpn":
+            results[key] = _login_webvpn(client, key, cfg, device_id)
+            print()
+            continue
 
         state = ""
         if cfg.get("needs_state_bootstrap"):
@@ -87,6 +95,61 @@ def login_all_systems(client: ShuSSO) -> dict[str, dict]:
     return results
 
 
+def _login_webvpn(client: ShuSSO, key: str, cfg: dict, device_id: str) -> dict:
+    """WebVPN 专用登录路径（SPA + 私有接口换会话）。
+
+    与其它系统的三点差异：
+      1. state 不是随机值，而是 base64({"externalId": <认证方式ID>})；
+      2. 授权请求额外带 access_type=offline；
+      3. code 不靠 302 换会话，而是 POST /api/access/auth/finish 交给 WebVPN，
+         由服务端拿 code 去 newsso 换 token 并建立 WebVPN 会话。
+    """
+    # [OAuth ①] 先取认证方式的固定 ID，它决定本次 state 的内容
+    ext = client.webvpn_external_id()
+    if not ext.get("external_id"):
+        log("     ✗ 未能取得认证方式 externalId")
+        return {"logged_in": False, "reason": "no_external_id", "auth_list": ext}
+    external_id = ext["external_id"]
+    log(f"     [OAuth ①] 认证方式 externalId: {external_id}（来源 {ext['source']}）")
+
+    state = client.webvpn_state(external_id)
+    log(f"     [OAuth ①] 私有握手 POST /api/access/auth/start（state={state}）")
+    start = client.webvpn_auth_start(external_id, state)
+    if start.get("api_code") != 0:
+        # 这一步失败也仅是「未登记」，直连 newsso 授权仍可继续，故只告警不中断
+        log(f"     ! auth/start 返回 {start.get('api_code')}：{start.get('api_message')}")
+    elif start.get("login_url_direct"):
+        log(f"        服务端给出的授权地址 → {start['login_url_direct'][:100]}")
+
+    # [OAuth ③] 用同一 SSO 会话直连 newsso 授权（参数对齐服务端给出的地址）
+    auth = client.authorize(cfg["client_id"], cfg["redirect_uri"],
+                            cfg.get("scope", ""), state,
+                            extra_params=cfg.get("authorize_extra"))
+
+    if auth["needs_login"]:
+        log("     ✗ 需要重新登录（会话未复用）")
+        return {"logged_in": False, "reason": "session_not_reused", "authorize": auth}
+    if not auth["code"]:
+        log("     ✗ 未取到授权码")
+        return {"logged_in": False, "reason": "no_code", "authorize": auth}
+    log(f"     [OAuth ③] HTTP {auth['http_status']} → 取到 code: {mask(auth['code'], 8)}")
+
+    # [OAuth ④] 把 code 交给 WebVPN 换会话，再用 user/info 校验登录态
+    log("     [OAuth ④] POST /api/access/auth/finish + GET /api/access/user/info")
+    red = client.redeem_webvpn(key, auth["code"], external_id, state, device_id)
+    if red["logged_in"]:
+        log(f"     [OAuth ④] ✓ 登录成功 → userId={red['user_id']} "
+            f"username={red['username']}")
+    else:
+        log(f"     [OAuth ④] ✗ 登录失败 → {red['body_preview']}")
+        if red.get("pending_actions"):
+            log(f"        服务端要求先完成: {'、'.join(red['pending_actions'])}")
+
+    red["device_id"] = device_id
+    red["external_id"] = external_id
+    return red
+
+
 def print_summary(results: dict[str, dict]) -> int:
     """打印汇总，返回成功系统数。"""
     log("=" * 62)
@@ -105,7 +168,7 @@ def print_summary(results: dict[str, dict]) -> int:
 
 
 def password_flow(args) -> int:
-    """账号密码登录流程：输入凭据 → 可选 2FA → 自动登录 3 个系统。
+    """账号密码登录流程：输入凭据 → 可选 2FA → 自动登录全部业务系统。
 
     返回退出码（0 全部成功，其余为失败）。
     """
@@ -212,7 +275,8 @@ def password_flow(args) -> int:
             log(f"\n[企微扫码] 未能解析出 key（HTTP {wecom.get('http_status')}）")
 
     # ---------- 第 3 步：逐个系统换授权 ----------
-    results = login_all_systems(client)
+    # WebVPN 的 deviceId 在前端是浏览器指纹，这里按账号生成稳定的伪指纹
+    results = login_all_systems(client, device_id=device_id_for(username))
     ok = print_summary(results)
 
     log("")
@@ -240,7 +304,7 @@ def password_flow(args) -> int:
 
 
 def wecom_scan_flow(args) -> int:
-    """企业微信扫码登录：生成二维码 → 长轮询等 auth_code → 换 SSO 会话 → 登录 3 个系统。
+    """企业微信扫码登录：生成二维码 → 长轮询等 auth_code → 换 SSO 会话 → 登录全部业务系统。
 
     机制（用 Chrome DevTools 抓包确认）：
       1. qrConnect 页面内嵌 qrImg?key=<key>，key 即本次扫码会话标识；
@@ -316,8 +380,9 @@ def wecom_scan_flow(args) -> int:
     log(f"  ✓ SSO 会话已建立（Cookie: SHU_OAUTH2）")
     log(f"     → {red['location'][:90]}")
 
-    # ---------- 用同一会话依次登录 3 个系统 ----------
-    results = login_all_systems(client)
+    # ---------- 用同一会话依次登录全部系统 ----------
+    # 扫码模式下拿不到学号，deviceId 用空账号名派生（仍然是稳定值）
+    results = login_all_systems(client, device_id=device_id_for(""))
     ok = print_summary(results)
 
     path = save_json("script-wecom-scan.json", {

@@ -1,6 +1,6 @@
 # shu-sso-poc
 
-上海大学（SHU）统一身份认证 SSO 登录 POC —— 一次登录，向 3 个业务系统分别换取授权并验证登录。
+上海大学（SHU）统一身份认证 SSO 登录 POC —— 一次登录，向多个业务系统（教务 / OTP / BBS / WebVPN）分别换取授权并验证登录。
 
 ## 项目结构
 
@@ -41,6 +41,7 @@ OAuth 2.0 授权码模式（RFC 6749），**非 OIDC**。
 - 2FA：`POST /oauth/twoStep/send` + `POST /oauth/twoStep/verify`
 - 登录（企微扫码）：企微 `qrConnect` 取 key → 长轮询 `/wwopen/sso/l/qrConnect` 拿 `auth_code` → `GET /oauth/wecom/qrcode`
 - 授权：`GET /oauth/authorize`
+- 换会话：多数系统跟随 `302`；**WebVPN 例外**，用私有接口 `POST /api/access/auth/finish`（见下节）
 
 关键结论：**授权码一次性、绑定 state 不可复用**；但 SSO 会话 Cookie 在 newsso 域内可被多系统复用。
 
@@ -59,12 +60,12 @@ python poc.py --scan-timeout 300       # 扫码等待秒数（默认 180）
 
 | 选项 | 模式 | 说明 |
 | --- | --- | --- |
-| `[1]` | `password` | 学号/工号 + 密码 + 两步验证（企业微信/短信），登录后自动跑通 3 个业务系统 |
-| `[2]` | `wecom_scan` | 企业微信扫码，扫码确认后自动建立会话并登录 3 个业务系统 |
+| `[1]` | `password` | 学号/工号 + 密码 + 两步验证（企业微信/短信），登录后自动跑通全部业务系统 |
+| `[2]` | `wecom_scan` | 企业微信扫码，扫码确认后自动建立会话并登录全部业务系统 |
 
-**账号密码模式**交互流程：输入学号 → 输入密码（不回显）→ 选择 2FA（1 企业微信 / 2 短信）→ 输入验证码 → 自动登录 3 个系统并输出结果。
+**账号密码模式**交互流程：输入学号 → 输入密码（不回显）→ 选择 2FA（1 企业微信 / 2 短信）→ 输入验证码 → 自动登录全部系统并输出结果。
 
-**企微扫码模式**：脚本生成二维码 → 用企业微信扫码并确认 → 脚本长轮询拿到 `auth_code` → 换取 `SHU_OAUTH2` 会话 → 自动登录 3 个系统。输出示例：
+**企微扫码模式**：脚本生成二维码 → 用企业微信扫码并确认 → 脚本长轮询拿到 `auth_code` → 换取 `SHU_OAUTH2` 会话 → 自动登录全部系统。输出示例：
 
 ```text
 ① 二维码图片 URL            https://open.work.weixin.qq.com/wwopen/sso/qrImg?key=<key>
@@ -86,8 +87,91 @@ python poc.py --scan-timeout 300       # 扫码等待秒数（默认 180）
 | `jwxt` | 本科生教务系统 | 自行生成 state |
 | `otp` | OTP 令牌 | 先向其要 state |
 | `bbs` | 上大 bbs（乐乎）| 先向其要 state，再改走 newsso 授权 |
+| `webvpn` | WebVPN 访问控制系统 | 私有接口换会话（见下节） |
 
-每个系统 state 策略不同：`jwxt` 自生成随机 state；`otp`、`bbs` 需先访问自身入口预取 state（OTP 回调还依赖 `Refresh` 头跳转）。
+每个系统 state 策略不同：`jwxt` 自生成随机 state；`otp`、`bbs` 需先访问自身入口预取 state（OTP 回调还依赖 `Refresh` 头跳转）；
+`webvpn` 的 state 则固定为 `base64({"externalId": <认证方式ID>})`。
+
+## WebVPN 访问控制系统（第四个系统）
+
+本站点为 `https://webvpn.shu.edu.cn`。
+
+OAuth 客户端信息（从 `/` 前端跳转的 `/oauth2/login/<paramsBase64>` 解出，
+并经 `Chrome DevTools` 抓包核对）：
+
+```json
+{"responseType":"code",
+ "clientId":"nn7sbb22j2tKE100T024tEp42777p755",
+ "clientName":"WebVPN访问控制系统",
+ "scope":"",
+ "redirectUri":"https://webvpn.shu.edu.cn/callback/oauth2",
+ "state":"eyJleHRlcm5hbElkIjoiWUpydlNYV2wifQ=="}
+```
+
+| 项 | 值 |
+| --- | --- |
+| `client_id` | `nn7sbb22j2tKE100T024tEp42777p755` |
+| `redirect_uri` | `https://webvpn.shu.edu.cn/callback/oauth2` |
+| `scope` | 空 |
+| 额外授权参数 | `access_type=offline` |
+
+### 与其它三个系统的差异
+
+WebVPN 是纯前端 SPA（nginx 对**所有**路径都返回同一份 `index.html`），因此：
+
+1. **拿 code 之后不是 302 换会话**，而是调两个私有接口完成握手；
+2. **URL / 正文关键词判定全部失效**——`/callback/oauth2`、`/site-nav/`、`/auth/login`
+   返回的字节完全相同，且页面模板里本身就有 `WebVPN` 字样，用作成功判定只会产生假阳性。
+   本 POC 只能以接口返回码判定（`detection: "api"`）。
+
+### 握手链路（Chrome DevTools 抓包还原）
+
+```text
+① POST /api/access/auth/start
+   {"externalId":"YJrvSXWl",
+    "data":"{\"callbackUrl\":\"https://webvpn.shu.edu.cn/callback/oauth2\",
+             \"state\":\"eyJleHRlcm5hbElkIjoiWUpydlNYV2wifQ==\"}"}
+   ← {"code":0,"data":{"action":{"login_url":".../oauth/authorize?access_type=offline&..."}}}
+
+② 浏览器跳到 login_url → newsso 302 回
+   https://webvpn.shu.edu.cn/callback/oauth2?code=...&state=...
+
+③ POST /api/access/auth/finish
+   {"externalId":"YJrvSXWl",
+    "data":"{\"callbackUrl\":\"...\",\"code\":\"<授权码>\",
+             \"deviceId\":\"<32位hex>\",\"state\":\"...\"}"}
+   ← {"code":0} 表示会话已建立（服务端拿 code 去 newsso 换 token）
+
+④ GET /api/access/user/info
+   ← {"code":0,"data":{"userId":...,"username":...}}   ← 判定登录成功的依据
+```
+
+### 几个实测坑
+
+- **`externalId` 不是随机值**，而是「认证方式」在服务端的固定 ID，由
+  `GET /api/access/authentication/list?type=0` 下发（取 `authType == 5`，即 `Oauth2Type`）。
+  当前值为 `YJrvSXWl`，与 `auth/start` 请求体中的完全一致。抓取失败时回退到内置常量。
+- **`state` 是标准 base64（带 `=` 填充）**，即前端 `btoa(JSON.stringify({externalId}))`。
+  注意这与 `utils.b64_params()` 用的 base64url（去填充）**不同**，别混用。
+- **`deviceId` 必填**：缺失时 `auth/finish` 返回 `{"code":20001,"message":"DeviceId未找到"}`；
+  带上任意非空值后才会走到 `20000 认证失败`（说明请求形状已正确）。
+  前端取的是 FingerprintJS 的 `visitorId`（持久化在浏览器，因此同一浏览器恒定）。
+  POC 没有浏览器指纹，用 `md5("shu-sso-poc::" + 账号名)` 生成**稳定**的伪造指纹
+  （见 `utils.device_id_for`），避免每次运行都被服务端当成新设备。
+- **WebVPN 会把 newsso 反代成另一个主机名**：`auth/start` 返回的 `login_url` 指向
+  `https-newsso-shu-edu-cn-443.webvpn.shu.edu.cn`，规则是
+  `<scheme>-<主机名中的 . 换成 ->-<端口>.webvpn.shu.edu.cn`。
+  而本 POC 的 `SHU_OAUTH2` 是直连 `newsso.shu.edu.cn` 建立的，直连才复用得上，
+  因此 `client.unproxy_url()` 会把反代主机还原回真实主机（仅当还原结果以
+  `.shu.edu.cn` 结尾时才改写，避免把带 Cookie 的请求发往意外主机）。
+  实测还原后的授权地址与服务端下发的参数**逐项一致**。
+- WebVPN 可能在登录后要求额外动作（`user/info` 会带 `needTriggerTFA` / `needChangePwd` /
+  `needToBindLocalAccount`）。POC 会把这些列进结果的 `pending_actions` 字段。
+
+### 归档的逆向材料
+
+分析用的前端 bundle 存放在 `_analysis_bundle/webvpn/`（`.gitignore` 已忽略），
+其中 `auth-DY9U0HS6.js` 是接口封装、`Oauth2Callback-CV3Kw-qa.js` 是回调处理逻辑。
 
 ## 企业微信扫码登录
 

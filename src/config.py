@@ -169,7 +169,38 @@ WECOM = {
     "scheme_jump_base": "wxwork://sso/jump?url=",
 }
 
-# 三个目标系统（client 注册信息已实测确认）
+# --------------------------------------------------------------------------
+# WebVPN 访问控制系统（webvpn.shu.edu.cn）
+# --------------------------------------------------------------------------
+# 与其它系统不同，WebVPN 是纯前端 SPA，拿到 code 后**不是**直接 302 换会话，
+# 而是由前端调两个私有接口完成握手（Chrome DevTools 抓包 + 读 bundle 还原）：
+#
+#   ① POST /api/access/auth/start
+#        body {"externalId": <认证方式ID>,
+#              "data": "{\"callbackUrl\":<回调>,\"state\":<base64({'externalId':...})>}"}
+#        -> data.action.login_url 即 newsso 的 /oauth/authorize 地址
+#   ② 浏览器跳到 login_url，newsso 302 回
+#        https://webvpn.shu.edu.cn/callback/oauth2?code=...&state=...
+#   ③ POST /api/access/auth/finish
+#        body {"externalId": ..., "data": "{\"callbackUrl\":...,\"code\":...,\"deviceId\":...,\"state\":...}"}
+#        -> {"code":0} 表示换会话成功（服务端拿 code 去 newsso 换 token）
+#   ④ GET /api/access/user/info -> data.userId 非 0 即已登录
+#
+# 注意：`externalId` 不是随机值，而是「认证方式」在服务端的固定 ID，可由
+# /api/access/authentication/list 查到（authType 5 = Oauth2Type）。
+WEBVPN = {
+    "base": "https://webvpn.shu.edu.cn",
+    "callback_url": "https://webvpn.shu.edu.cn/callback/oauth2",
+    "landing_url": "https://webvpn.shu.edu.cn/site-nav/",   # 登录后落地页
+    "auth_list": "/api/access/authentication/list",          # ?type=0
+    "auth_start": "/api/access/auth/start",
+    "auth_finish": "/api/access/auth/finish",
+    "user_info": "/api/access/user/info",
+    "auth_type_oauth2": 5,                 # 枚举值：Oauth2Type
+    "external_id_fallback": "YJrvSXWl",    # 2026-09-14 实测；抓取失败时的回退值
+}
+
+# 目标系统（client 注册信息已实测确认）
 SYSTEMS = {
     "jwxt": {
         "name": "本科生教务系统",
@@ -205,6 +236,20 @@ SYSTEMS = {
         "needs_state_bootstrap": "https://bbs.shu.edu.cn/auth/oauth2_basic",
         "success_url_contains": "bbs.shu.edu.cn",
         "success_body_contains": "乐乎",
+    },
+    "webvpn": {
+        "name": "WebVPN 访问控制系统",
+        "client_id": "nn7sbb22j2tKE100T024tEp42777p755",
+        "redirect_uri": "https://webvpn.shu.edu.cn/callback/oauth2",
+        "scope": "",
+        # 授权请求的额外参数（对齐前端发起的 login_url）
+        "authorize_extra": {"access_type": "offline"},
+        # state 不是随机值：state = base64({"externalId": <认证方式ID>})
+        "state_kind": "webvpn",
+        # 换取会话的方式：走 auth/start + auth/finish 两步私有握手
+        "redeem_kind": "webvpn",
+        # 该站是 SPA，任何路径都返回同一份 index.html（含 "WebVPN" 字样），
+        # 因此 URL / 正文关键词判定全部无效，只能靠接口返回码判定成功。
     },
 }
 
