@@ -9,6 +9,7 @@ import base64
 import hashlib
 import json
 import re
+import shutil
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
@@ -86,3 +87,104 @@ def mask(s: str, keep: int = 4) -> str:
     if not s:
         return ""
     return s[:keep] + "..." + s[-keep:] if len(s) > keep * 2 else s
+
+
+# --------------------------------------------------------------------------
+# 终端二维码渲染（直接给手机扫）
+# --------------------------------------------------------------------------
+# 企微 qrConnect 的二维码内容就是 confirm_url —— 已用 pyzbar 解码官方
+# qrImg?key=<key> 返回的 PNG 核对，内容与 confirm_url 逐字一致。
+# 因此本地用 qrcode 重新生成同样内容的二维码，扫码后打开的还是同一个确认页，
+# 不必再开浏览器点图片链接。
+_QR_BORDER = 2          # 静默区（模块数），留白保证识别率
+_QR_EC_LEVEL = "M"      # 纠错等级
+
+_FG_BLACK = "\x1b[30m"
+_FG_WHITE = "\x1b[37m"
+_BG_BLACK = "\x1b[40m"
+_BG_WHITE = "\x1b[47m"
+_SGR_RESET = "\x1b[0m"
+
+
+def qr_matrix(text: str) -> list[list[int]] | None:
+    """生成二维码模块矩阵（含静默区，1 = 黑模块）。未装 qrcode 时返回 None。"""
+    try:
+        import qrcode
+        from qrcode import constants
+    except ImportError:
+        return None
+
+    levels = {"L": constants.ERROR_CORRECT_L, "M": constants.ERROR_CORRECT_M,
+              "Q": constants.ERROR_CORRECT_Q, "H": constants.ERROR_CORRECT_H}
+    qr = qrcode.QRCode(error_correction=levels[_QR_EC_LEVEL], box_size=1,
+                       border=_QR_BORDER)
+    qr.add_data(text)
+    qr.make(fit=True)
+    return qr.get_matrix()
+
+
+def qr_half_block_lines(matrix: list[list[int]]) -> list[str]:
+    """把模块矩阵压成带 ANSI 颜色的半块字符行。
+
+    原理：`▀`（U+2580）用**前景色画字符格的上半、背景色画下半**，
+    于是「一个字符格承载上下两个模块」——行列比例正好接近二维码的方块比例
+    （终端字符高约为宽的 2 倍）。前景/背景都显式指定为纯黑/纯白，
+    因此不论终端是深色还是浅色主题，二维码都是「白底黑块」，不影响识别。
+    """
+    height = len(matrix)
+    width = len(matrix[0])
+    lines: list[str] = []
+
+    for y in range(0, height, 2):
+        top_row = matrix[y]
+        bottom_row = matrix[y + 1] if y + 1 < height else [0] * width
+        parts: list[str] = []
+        fg: bool | None = None      # 仅在颜色变化时才输出 ANSI 码，减少体积
+        bg: bool | None = None
+        for x in range(width):
+            top, bottom = bool(top_row[x]), bool(bottom_row[x])
+            if top != fg:
+                fg = top
+                parts.append(_FG_BLACK if top else _FG_WHITE)
+            if bottom != bg:
+                bg = bottom
+                parts.append(_BG_BLACK if bottom else _BG_WHITE)
+            parts.append("▀")
+        parts.append(_SGR_RESET)
+        lines.append("".join(parts))
+
+    return lines
+
+
+def qr_ascii_lines(matrix: list[list[int]]) -> list[str]:
+    """无颜色的保底样式：黑模块用两个整块字符、白模块用两个空格。
+
+    不依赖任何 ANSI 颜色，任何终端都能正确显示；代价是宽度翻倍
+    （每个模块占 2 列，与终端字符约 2:1 的高宽比相抵消，比例依然正确）。
+    """
+    return ["".join("██" if v else "  " for v in row) for row in matrix]
+
+
+_QR_STYLES = {"block": qr_half_block_lines, "ascii": qr_ascii_lines}
+_QR_STYLE_COLS = {"block": 1, "ascii": 2}      # 每个模块占用的列数
+
+
+def render_qr_terminal(text: str, style: str = "block") -> bool:
+    """把 text 渲染成可扫描的二维码打印到终端。成功返回 True。
+
+    style: `block`（默认，ANSI 半块，紧凑）或 `ascii`（无颜色，兼容性最好）。
+    失败（未安装 qrcode）返回 False，由调用方回退到打印图片 URL。
+    """
+    matrix = qr_matrix(text)
+    if matrix is None:
+        return False
+
+    style = style if style in _QR_STYLES else "block"
+    width = len(matrix[0]) * _QR_STYLE_COLS[style]
+    columns = shutil.get_terminal_size((80, 24)).columns
+    if width > columns:
+        log(f"  ! 终端每行只有 {columns} 列，放不下 {width} 列的二维码，"
+            f"建议拉宽窗口；也可用下方的图片 URL 扫码")
+
+    print("\n".join(_QR_STYLES[style](matrix)), flush=True)
+    return True

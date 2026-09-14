@@ -7,12 +7,14 @@
 from __future__ import annotations
 
 import getpass
+import sys
 import uuid
 from datetime import datetime
 
 from . import config
 from .client import ShuSSO
-from .utils import b64_params, device_id_for, log, mask, rsa_encrypt_password, save_json
+from .utils import (b64_params, device_id_for, log, mask, render_qr_terminal,
+                    rsa_encrypt_password, save_json)
 
 
 def banner() -> None:
@@ -268,6 +270,7 @@ def password_flow(args) -> int:
         wecom = client.wecom_qrcode_info(state=login_params)
         if wecom.get("key"):
             log("\n[企微扫码] 本次会话的二维码与唤起链接：")
+            print_wecom_qr(wecom["confirm_url"], args)
             log(f"     二维码图片 : {wecom['qr_img_url']}")
             log(f"     确认页地址 : {wecom['confirm_url']}")
             log(f"     URI 跳转   : {wecom['wxwork_scheme']}")
@@ -301,6 +304,25 @@ def password_flow(args) -> int:
     log(f"\n证据已保存: {path}（密码与授权码已脱敏）")
 
     return 0 if ok == len(config.SYSTEMS) else 5
+
+
+def print_wecom_qr(confirm_url: str, args) -> bool:
+    """在终端渲染企微扫码用的二维码，返回是否渲染成功。
+
+    三重保护：`--no-qr` 关闭、输出被重定向时跳过（避免 ANSI 码污染文件）、
+    未安装 qrcode 时返回 False（由调用方回退到打印图片 URL）。
+    """
+    if getattr(args, "no_qr", False):
+        log("     （已按 --no-qr 关闭终端二维码）")
+        return False
+    if not sys.stdout.isatty():
+        log("     （输出不是终端，跳过二维码渲染）")
+        return False
+    style = getattr(args, "qr_style", "block") or "block"
+    if render_qr_terminal(confirm_url, style):
+        return True
+    log("     （未安装 qrcode 库，无法渲染终端二维码：pip install qrcode）")
+    return False
 
 
 def wecom_scan_flow(args) -> int:
@@ -338,7 +360,11 @@ def wecom_scan_flow(args) -> int:
     line = "─" * 62
     print()
     print(line)
-    print(" 请用企业微信扫描下面的二维码并在手机上点「确认登录」")
+    if print_wecom_qr(info["confirm_url"], args):
+        print(" 请用企业微信扫描下方二维码，并在手机上点「确认登录」")
+    else:
+        print(" 请用企业微信扫码并在手机上点「确认登录」（二维码见下方 ①）")
+    print(line)
     print()
     print(" ① 二维码图片 URL（浏览器打开即可扫码）")
     print(f"    {info['qr_img_url']}")

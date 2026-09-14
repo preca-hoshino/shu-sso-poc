@@ -50,6 +50,11 @@ def main() -> int:
                         help="账号密码登录时的 2FA 方式（省略则交互选择）")
     parser.add_argument("--scan-timeout", type=int, default=180,
                         help="企微扫码等待秒数（默认 180）")
+    parser.add_argument("--no-qr", action="store_true",
+                        help="不在终端渲染二维码（默认渲染，可直接用手机扫）")
+    parser.add_argument("--qr-style", choices=["block", "ascii"], default="block",
+                        help="二维码样式：block=ANSI 半块（默认，紧凑）；"
+                             "ascii=无颜色整块（终端不支持颜色时用）")
     args = parser.parse_args()
 
     banner()
