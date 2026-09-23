@@ -3,7 +3,7 @@
 # SHU SSO POC
 
 上海大学统一身份认证（`newsso.shu.edu.cn`）OAuth 2.0 授权码流程验证工具 ——
-**一次登录，向 jwxt / otp / bbs / webvpn 四个业务系统分别换取授权并验证登录**
+**一次登录，向 jwxt / otp / bbs / webvpn / ds 五个业务系统分别换取授权并验证登录**
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Protocol](https://img.shields.io/badge/OAuth%202.0-RFC%206749-informational)](https://datatracker.ietf.org/doc/html/rfc6749)
@@ -29,10 +29,12 @@ flowchart TD
     I --> F
     F --> J["遍历 config.SYSTEMS"]
     J --> K["GET /oauth/authorize"]
-    K --> L{"redeem_kind"}
+    K --> L{"该系统有 client.py？"}
     L -->|webvpn| M["POST /api/access/auth/finish<br/>GET /api/access/user/info"]
-    L -->|其他| N["跟随 302 / Refresh 头换会话"]
+    L -->|ds| P["GET /dsssologin/getSsoUser<br/>看 isSussess 字段"]
+    L -->|无| N["跟随 302 / Refresh 头换会话"]
     M --> O["汇总结果<br/>保存脱敏证据 JSON"]
+    P --> O
     N --> O
 ```
 
@@ -48,7 +50,7 @@ flowchart TD
 | 发码 | `POST /oauth/twoStep/send` | `{method: sms \| wecom}` |
 | 校验 | `POST /oauth/twoStep/verify` | `{username, password, tenantId, params, code, method}` |
 
-- 密码以 RSA PKCS#1 v1.5 加密后 base64 提交，公钥来自自动更新的 `config.RSA_PUBLIC_KEY_PEM`；
+- 密码以 RSA PKCS#1 v1.5 加密后 base64 提交，公钥来自 `rsa_key.public_key_pem()`（自动更新）；
 - `params` **必填**，缺失直接返回 `badRequestParams`；
 - 响应中 `twoStepRequired` 为真才进入两步验证；
 - 成功后服务端下发 `SHU_OAUTH2`（HttpOnly，host-scoped 于 `newsso.shu.edu.cn`）。
@@ -129,12 +131,13 @@ GET /oauth/authorize?response_type=code&client_id=...&redirect_uri=...&scope=...
   └─ 302 Location: <redirect_uri>?code=...&state=...
 ```
 
-| key | 系统 | `client_id` | 取到 code 后如何换会话 |
-| :--- | :--- | :--- | :--- |
-| `jwxt` | 本科生教务系统 | `Km5t225E8KECKQ6ZDm5K2P6aS2459Cua` | 跟随 `302` |
-| `otp` | OTP 令牌 | `05Q1L8woQK5350aK1U5o5GKh411ar3h1` | 跟随 `Refresh` 头跳转 |
-| `bbs` | 上大 bbs（乐乎社区） | `vp8G2H42GGE86LP822LHF6Hs7f46483H` | 跟随 `302` |
-| `webvpn` | WebVPN 访问控制系统 | `nn7sbb22j2tKE100T024tEp42777p755` | 私有接口两步握手（见 ④） |
+| key | 系统 | `client_id` | 取到 code 后如何换会话 | 配置与说明 |
+| :--- | :--- | :--- | :--- | :--- |
+| `jwxt` | 本科生教务系统 | `Km5t225E8KECKQ6ZDm5K2P6aS2459Cua` | 跟随 `302` | [`systems/jwxt.shu.edu.cn/`](systems/jwxt.shu.edu.cn/README.md) |
+| `otp` | OTP 令牌 | `05Q1L8woQK5350aK1U5o5GKh411ar3h1` | 跟随 `Refresh` 头跳转 | [`systems/otp.shu.edu.cn/`](systems/otp.shu.edu.cn/README.md) |
+| `bbs` | 上大 bbs（乐乎社区） | `vp8G2H42GGE86LP822LHF6Hs7f46483H` | 跟随 `302` | [`systems/bbs.shu.edu.cn/`](systems/bbs.shu.edu.cn/README.md) |
+| `webvpn` | WebVPN 访问控制系统 | `nn7sbb22j2tKE100T024tEp42777p755` | 私有接口两步握手（见 ④） | [`systems/webvpn.shu.edu.cn/`](systems/webvpn.shu.edu.cn/README.md) |
+| `ds` | 千学百科（DeepSeek） | `re0owG1g776ng2eix7x3o8sa20W6OdA2` | 私有接口换 token（见 ④） | [`systems/ds.shu.edu.cn/`](systems/ds.shu.edu.cn/README.md) |
 
 **`state` 策略各不相同**，是全流程最容易踩坑的一环：
 
@@ -144,6 +147,7 @@ GET /oauth/authorize?response_type=code&client_id=...&redirect_uri=...&scope=...
 | `otp` | 需先访问 `https://otp.shu.edu.cn/` 预取 `state`（存于 `ASP.NET_SessionId`），否则回调报「State验证失败」 |
 | `bbs` | 需先访问 `https://bbs.shu.edu.cn/auth/oauth2_basic` 向其索要 `state` |
 | `webvpn` | `state` 为固定结构化值 `base64({"externalId": <认证方式ID>})`，非随机 |
+| `ds` | 授权请求**完全不带 `state` / `scope`**（前端直接拼 URL） |
 
 **Base64 有两种形态，不可混用**：
 
@@ -152,8 +156,10 @@ GET /oauth/authorize?response_type=code&client_id=...&redirect_uri=...&scope=...
 | `params` 参数（`utils.b64_params`） | base64**url** | `-_` 字符集，**去除 `=` 填充** |
 | WebVPN 的 `state` | 标准 base64 | `+/` 字符集，**保留 `=` 填充**（`btoa` 行为） |
 
-新增业务系统只需在 `src/config.py` 的 `SYSTEMS` 中追加一项，核心流程无需改动 ——
-各系统通过 `redeem_kind` / `state_kind` / `detection` 等字段声明自身差异。
+新增业务系统**不用改 `src/`** —— 在 [`systems/`](systems/README.md) 下新建 `<系统域名>/config.py`
+（导出 `SYSTEM` 字典），只有换会话不走「跟随 `302`」时才再加一个 `client.py`。
+各系统的差异（`generate_state` / `needs_state_bootstrap` / `authorize_extra` /
+`detection` 等）全部写在它自己的配置文件里，字段含义见 [`systems/README.md`](systems/README.md)。
 
 ### ④ 换会话：`code` → 系统会话
 
@@ -195,12 +201,12 @@ GET /oauth/authorize?response_type=code&client_id=...&redirect_uri=...&scope=...
 
 - **`externalId` 是固定值而非随机值** —— 它是「认证方式」在服务端的 ID，由
   `GET /api/access/authentication/list?type=0` 下发（取 `authType == 5`，即 `Oauth2Type`）。
-  实测值 `YJrvSXWl`，抓取失败时回退到 `config.WEBVPN["external_id_fallback"]`。
+  实测值 `YJrvSXWl`，抓取失败时回退到该系统配置里的 `external_id_fallback`。
 - **`deviceId` 必填** —— 缺失时 `auth/finish` 返回 `{"code":20001,"message":"DeviceId未找到"}`；
   提供任意非空值后即推进到 `20000 认证失败`（说明请求结构已正确）。
   前端取 FingerprintJS 的 `visitorId`（持久化于浏览器，故同一浏览器恒定）。
   POC 无浏览器指纹，使用 `md5("shu-sso-poc::" + 账号名)` 生成**稳定**伪指纹
-  （`utils.device_id_for`），避免每次运行被服务端视为新设备。
+  （`systems/webvpn.shu.edu.cn/client.py` 的 `device_id_for`），避免每次运行被服务端视为新设备。
 - **WebVPN 会反代 newsso** —— `auth/start` 返回的 `login_url` 指向
   `https-newsso-shu-edu-cn-443.webvpn.shu.edu.cn`，规则为
   `<scheme>-<主机名中的 . 替换为 ->-<端口>.webvpn.shu.edu.cn`。
@@ -213,15 +219,59 @@ GET /oauth/authorize?response_type=code&client_id=...&redirect_uri=...&scope=...
 - **登录后可能有附加动作** —— `user/info` 会带 `needTriggerTFA` / `needChangePwd` /
   `needToBindLocalAccount`，POC 将其列入结果的 `pending_actions` 字段。
 
+> 该系统的完整参数与约束：[`systems/webvpn.shu.edu.cn/README.md`](systems/webvpn.shu.edu.cn/README.md)；
+> 配置：[`systems/webvpn.shu.edu.cn/config.py`](systems/webvpn.shu.edu.cn/config.py)、
+> 实现：[`systems/webvpn.shu.edu.cn/client.py`](systems/webvpn.shu.edu.cn/client.py)。
+>
 > 逆向材料：`_analysis_bundle/webvpn/`（已被 `.gitignore` 忽略），
 > `auth-DY9U0HS6.js` 为接口封装，`Oauth2Callback-CV3Kw-qa.js` 为回调处理逻辑。
+
+**千学百科例外**：同为纯前端 SPA，但换会话由 ds 自己的**后端**完成 ——
+前端只需把 `code` 递过去，服务端持 `code` 去 newsso 换 token：
+
+```text
+① GET https://newsso.shu.edu.cn/oauth/authorize
+        ?response_type=code&client_id=<ds 的 client_id>
+        &redirect_uri=https://ds.shu.edu.cn/login        ← 无 state、无 scope
+② newsso 302 → https://ds.shu.edu.cn/login?code=...
+③ GET https://ds.shu.edu.cn/dsssologin/getSsoUser
+        ?code=<授权码>&url=https://ds.shu.edu.cn/login
+   ← {"isSussess": true, "datas": "{\"userid\": ...}"}    ← 判定依据（字段名确实拼作 isSussess）
+```
+
+| 项 | 值 |
+| :--- | :--- |
+| `client_id` | `re0owG1g776ng2eix7x3o8sa20W6OdA2` |
+| `redirect_uri` | `https://ds.shu.edu.cn/login` |
+| `scope` | 空 |
+| `state` | 不传 |
+
+实测约束：
+
+- **换 token 失败会直说原因** —— 用无效 `code` 请求时返回
+  `{"isSussess":false,"errMsg":"获取token失败：{...\"error\":\"invalid_grant\"...}"}`，
+  即 ds 服务端走的是标准 OAuth 码换 token，且 `url` 必须与授权时的 `redirect_uri` 一致；
+- **`datas` 是「JSON 字符串」而非对象** —— 前端写的是 `JSON.parse(u.datas)`，
+  故 POC 也做二次解析（`client.redeem_ds`）；
+- **ds 的会话不在 Cookie 里** —— 前端把 `datas.userid` 存 `localStorage` 当 Bearer token，
+  因此无法靠「跟随跳转 + URL/正文关键词」判定，只能以 `getSsoUser` 的 `isSussess` 为准
+  （`detection: "api"`）；该站同样对任何路径都返回同一份 `index.html`。
+
+> 该系统的完整参数与约束：[`systems/ds.shu.edu.cn/README.md`](systems/ds.shu.edu.cn/README.md)；
+> 配置：[`systems/ds.shu.edu.cn/config.py`](systems/ds.shu.edu.cn/config.py)、
+> 实现：[`systems/ds.shu.edu.cn/client.py`](systems/ds.shu.edu.cn/client.py)。
+>
+> 逆向材料：`_analysis_bundle/ds/`（已被 `.gitignore` 忽略），
+> `entry-index-*.js` 内含路由守卫与 `getSsoUser` 调用，`login-chunk-*.js` 内含授权 URL 拼接。
 
 ### 关键结论
 
 1. **授权码一次性、绑定 `state`，不可复用**；
 2. **SSO 会话 Cookie 可复用** —— `SHU_OAUTH2` host-scoped 于 `newsso.shu.edu.cn`，
    只要后续授权请求仍发往 newsso，即可免登录直接取得新的授权码；
-3. 各业务系统仅负责「用 `code` 换自己的会话」，彼此独立、互不影响。
+3. 各业务系统仅负责「用 `code` 换自己的会话」，彼此独立、互不影响 ——
+   任一系统失败（网络异常、上游改版、接口报错等）**只记为该项失败，不会中断其余系统**，
+   汇总表会逐项列出失败原因（详见 `src/runner.py` 的 `login_all_systems()`）。
 
 ```text
                           ┌──────────────────────────────┐
@@ -229,9 +279,9 @@ GET /oauth/authorize?response_type=code&client_id=...&redirect_uri=...&scope=...
                           │  SHU_OAUTH2（host-scoped）    │
                           └───────────────┬──────────────┘
                                           │ 复用同一会话
-        ┌─────────────┬───────────────────┼───────────────┬─────────────┐
-        ▼             ▼                   ▼               ▼             ▼
-      jwxt          otp                 bbs            webvpn      （可扩展）
+        ┌─────────────┬───────────────────┼───────────────┬─────────────┬─────────────┐
+        ▼             ▼                   ▼               ▼             ▼             ▼
+      jwxt          otp                 bbs            webvpn          ds       （可扩展）
 ```
 
 ## 快速开始
@@ -354,52 +404,111 @@ python poc.py --qr-style ascii         # 二维码改用无颜色整块样式
 ### 项目结构
 
 ```text
-poc.py          CLI 入口（参数解析、模式选择、分发）
+poc.py                  CLI 入口（参数解析、模式选择、分发）
 src/
-  config.py     协议常量（端点、RSA 公钥、企微参数、目标系统）
-  utils.py      工具函数（RSA 加密、base64url、脱敏、日志、终端二维码）
-  client.py     ShuSSO HTTP 客户端（newsso + 各业务系统）
-  flows.py      高层登录流程（密码 / 企微扫码、批量登录、汇总）
+  config.py             newsso 协议常量（端点 / 企微参数）+ 装载系统注册表
+  registry.py           系统注册表：扫描 systems/ 装载配置与换会话实现
+  rsa_key.py            RSA 公钥抓取 / 缓存 / 回退
+  utils.py              工具函数（RSA 加密、base64url、脱敏、日志）
+  system_api.py         系统实现的接口（RedeemContext / fail / 辅助函数）
+  client.py             ShuSSO HTTP 客户端（只放所有系统共用的能力）
+  runner.py             批量登录（逐系统隔离）与证据落盘
+  entry_password.py     账号密码入口
+  entry_wecom.py        企微扫码入口
+  ui.py                 横幅 / 菜单 / 汇总表 / 错误提示
+  qr.py                 终端二维码渲染
+systems/                ★ 可能变动的系统配置与实现，按域名分目录
+  README.md             目录约定与 SYSTEM 字段说明
+  <域名>/config.py      该系统的 client 信息 / 换会话方式 / 成功判定
+  <域名>/client.py      可选：换会话实现（只有不走「跟随 302」的系统才有）
+  <域名>/README.md      该系统的介绍 / OAuth 参数 / 特殊设计
+tests/
+  test_offline.py       离线测试（假会话跑真实代码，不打真实网络）
 ```
 
-核心逻辑全部位于 `src/`，`poc.py` 仅负责命令行入口。
+`poc.py` 只做命令行入口，`src/` 放与具体系统无关的机制，业务系统的差异**全部**外置在 `systems/`。
+
+### 系统交换配置（`systems/`）
+
+每个系统一个目录，目录名就是它的域名，键取域名首段（`ds.shu.edu.cn` → `ds`）：
+
+| 系统 | 配置与说明 | 换会话 | 判定依据 |
+| :--- | :--- | :--- | :--- |
+| `jwxt` | [`systems/jwxt.shu.edu.cn/`](systems/jwxt.shu.edu.cn/README.md) | 跟随 `302` | URL / 正文关键词 |
+| `otp` | [`systems/otp.shu.edu.cn/`](systems/otp.shu.edu.cn/README.md) | 跟随 `Refresh` 头 | URL / 正文关键词 |
+| `bbs` | [`systems/bbs.shu.edu.cn/`](systems/bbs.shu.edu.cn/README.md) | 跟随 `302` | URL / 正文关键词 |
+| `webvpn` | [`systems/webvpn.shu.edu.cn/`](systems/webvpn.shu.edu.cn/README.md) | 私有接口握手 | 接口返回码（`detection: api`） |
+| `ds` | [`systems/ds.shu.edu.cn/`](systems/ds.shu.edu.cn/README.md) | 后端接口换 token | 接口返回码（`detection: api`） |
+
+- 目录约定、`SYSTEM` 全部字段、新增系统的步骤：见 [`systems/README.md`](systems/README.md)；
+- 各系统的 README 都按「一句话介绍 → OAuth 参数表格 → 特殊设计」写，
+  改上游相关问题先看对应那一篇；
+- 加载顺序按目录名排序，`_` / `.` 开头的目录会被跳过。
+
+**换会话实现的发现规则**：系统目录里若有 `client.py` 且导出 `redeem(ctx)`，
+`runner.login_one()` 就用它；没有就走通用路径（授权取码 → 跟随 `302`）。
+实现拿到的是 `system_api.RedeemContext`（`client` / `key` / `cfg` / `username`），
+可直接用 `ctx.client.sess` 发请求、`ctx.client.authorize()` 取码、`ctx.client.record()` 记 trace。
 
 ### 模块 API
 
 | 模块 | 主要符号 | 说明 |
 | :--- | :--- | :--- |
-| `config` | `SSO_BASE` `WECOM` `WEBVPN` `SYSTEMS` `CAPTURE_DIR` | 协议常量与目标系统注册表 |
-| `config` | `fetch_rsa_public_key_pem()` | 从线上 bundle 抓取最新 RSA 公钥 |
+| `config` | `SSO_BASE` `WECOM` `SYSTEMS` `CAPTURE_DIR` | newsso 协议常量与系统注册表（`SYSTEMS` 由 `registry` 装载） |
+| `rsa_key` | `fetch_rsa_public_key_pem()` / `public_key_pem()` | 公钥抓取与缓存（导入不联网，首次使用时才取） |
+| `registry` | `load_systems()` / `redeem_impl()` / `impl_module()` | 装载系统配置与换会话实现 |
+| `system_api` | `RedeemContext` / `fail()` / `json_or_error()` | 系统实现的接口与辅助函数 |
 | `utils` | `rsa_encrypt_password()` `b64_params()` | 密码加密与参数编码 |
-| `utils` | `device_id_for()` `mask()` `redact()` `save_json()` | 伪指纹、脱敏与证据落盘 |
-| `utils` | `render_qr_terminal()` | 终端二维码渲染 |
+| `utils` | `mask()` `redact()` `save_json()` | 脱敏与证据落盘 |
 | `client` | `ShuSSO.login` / `send_2fa_code` / `verify_2fa_code` | 认证与两步验证 |
 | `client` | `ShuSSO.authorize` / `redeem` / `bootstrap_state` | 通用授权与换会话 |
 | `client` | `ShuSSO.wecom_qrcode_info` / `wecom_wait_scan` / `wecom_redeem` | 企微扫码链路 |
-| `client` | `ShuSSO.webvpn_*` / `redeem_webvpn` | WebVPN 私有握手 |
-| `client` | `unproxy_url()` | WebVPN 反代主机名还原 |
-| `flows` | `password_flow()` / `wecom_scan_flow()` | 两种登录入口 |
-| `flows` | `login_all_systems()` / `print_summary()` | 批量登录与结果汇总 |
+| `runner` | `login_all_systems()` / `login_one()` / `save_evidence()` | 批量登录（逐系统隔离）与落盘 |
+| `ui` | `banner()` `choose_login_mode()` `print_summary()` | 终端呈现 |
+| `qr` | `render_qr_terminal()` | 终端二维码渲染 |
+| `entry_password` / `entry_wecom` | `password_flow()` / `wecom_scan_flow()` | 两种登录入口 |
+| `systems/<域名>/client.py` | `redeem(ctx)` | 该系统专属换会话实现（webvpn / ds） |
 
 ### RSA 公钥自动更新
 
-登录密码使用 newsso 前端 bundle 中的 RSA 公钥（`config.RSA_PUBLIC_KEY_PEM`）加密。
-该公钥位于登录 chunk `/p__oauth2__login__index.<hash>.async.js` 内
-（经 `setPublicKey(Pe)` 传给 JSEncrypt）。每次前端重新打包 hash 都会变化，公钥亦可能随部署更新，
-因此 `config` 在**模块导入时自动抓取最新值**：
+登录密码使用 newsso 前端 bundle 中的 RSA 公钥加密，该公钥位于登录 chunk
+`/p__oauth2__login__index.<hash>.async.js` 内（经 `setPublicKey(Pe)` 传给 JSEncrypt）。
+每次前端重新打包 hash 都会变化，公钥亦可能随部署更新，
+因此 `rsa_key.public_key_pem()` 在**首次使用时**取一次（`lru_cache`，导入不联网）：
 
 | 优先级 | 来源 | 说明 |
 | :---: | :--- | :--- |
-| 1 | **线上抓取** | `GET /oauth2/login/` → 解析 `preload_helper \| umi` 清单 → 定位登录 chunk → 正则提取 PEM |
-| 2 | **本地缓存** | 抓取成功后写入 `.rsa_public_key.pem`，后续导入直接复用，不再联网 |
-| 3 | **内置回退** | 联网失败时使用 `RSA_PUBLIC_KEY_PEM_FALLBACK` |
+| 1 | **本地缓存** | `.rsa_public_key.pem` 存在且合法就直接用 |
+| 2 | **线上抓取** | `GET /oauth2/login/` → 解析 `preload_helper \| umi` 清单 → 定位登录 chunk → 正则提取 PEM，成功后写缓存 |
+| 3 | **内置回退** | 联网失败时使用 `rsa_key.FALLBACK_PEM` |
 
 也可手动调用：
 
 ```python
-from src.config import fetch_rsa_public_key_pem
+from src.rsa_key import fetch_rsa_public_key_pem
 pem = fetch_rsa_public_key_pem()   # 成功返回最新 PEM，失败返回 None
 ```
+
+### 离线测试
+
+`tests/test_offline.py` 用**假会话**替换 `requests.Session`、预设 `authorize()` 的返回，
+其余全走真实代码（注册表装载、实现分派、批量登录、通用换会话）：
+
+```bash
+python tests/test_offline.py     # 只用标准库
+pytest tests/                    # 若装了 pytest
+```
+
+| 用例 | 覆盖点 |
+| :--- | :--- |
+| 注册表 | 5 个系统全部装载；`ds` / `webvpn` 有专属实现，其余走通用路径 |
+| 编码 | `params` 是 base64url 去填充；webvpn 的 `state` 是标准 base64 带填充 |
+| 反代还原 | 仅 `.shu.edu.cn` 结尾的主机才改写（避免带 Cookie 的请求发往意外主机） |
+| 脱敏 | 按键名剔除 + URL 查询串里的 `?code=` |
+| 全链路 | webvpn / ds / 通用系统三条路径都能换到会话，且授权参数各自正确 |
+| 早期失败 | 未复用会话 / 未取到 code → 转成 `reason` 而非异常 |
+| 失败隔离 | 单个系统抛异常不影响其余；接口报错如实记录 |
+| 中断语义 | `Ctrl+C`（`KeyboardInterrupt`）仍会终止全局 |
 
 ### 退出码
 
@@ -447,15 +556,17 @@ pem = fetch_rsa_public_key_pem()   # 成功返回最新 PEM，失败返回 None
 <summary><b>OTP 回调提示「State验证失败」？</b></summary>
 
 `otp.shu.edu.cn` 会校验存于 `ASP.NET_SessionId` 中的 `state`。
-必须先访问其入口页预取 `state`（见 `SYSTEMS["otp"]["needs_state_bootstrap"]`）后再发起授权。
+必须先访问其入口页预取 `state`（见
+[`systems/otp.shu.edu.cn/config.py`](systems/otp.shu.edu.cn/config.py) 的 `needs_state_bootstrap`）
+后再发起授权。
 
 </details>
 
 <details>
 <summary><b>WebVPN 返回 <code>20001 DeviceId未找到</code>？</b></summary>
 
-`auth/finish` 的 `deviceId` 为必填项。POC 默认由 `utils.device_id_for(账号名)` 生成稳定伪指纹，
-请检查传入的 `device_id` / 账号名是否为空。
+`auth/finish` 的 `deviceId` 为必填项。POC 默认由 `systems/webvpn.shu.edu.cn/client.py`
+的 `device_id_for(账号名)` 生成稳定伪指纹，请检查传入的用户名是否为空（扫码登录时为 `""`，仍是稳定值）。
 
 </details>
 
@@ -472,9 +583,30 @@ pem = fetch_rsa_public_key_pem()   # 成功返回最新 PEM，失败返回 None
 <details>
 <summary><b>系统实际登录成功，却被判定为失败？</b></summary>
 
-除 `webvpn` 外，其余系统通过 URL / 正文关键词判定成功。
-若上游页面改版，请同步更新 `SYSTEMS` 中对应系统的
-`success_url_contains` / `success_body_contains`。
+除 `webvpn`、`ds` 外，其余系统通过 URL / 正文关键词判定成功。
+若上游页面改版，请同步更新该系统配置里的
+`success_url_contains` / `success_body_contains` —— 见 [`systems/`](systems/README.md)
+下对应目录的 `config.py` 与 `README.md`。
+
+</details>
+
+<details>
+<summary><b>想加一个新系统要改哪些地方？</b></summary>
+
+通常**不用改 `src/`**：在 [`systems/`](systems/README.md) 下新建 `<系统域名>/config.py`，
+填好 `name` / `client_id` / `redirect_uri` / `scope` 与判定字段即可接入。
+只有当换会话不是「跟随 302」时，才需要在同目录再加一个 `client.py`，导出
+`redeem(ctx)`（照 `webvpn` / `ds` 抄）—— 有它就会被自动识别，无需任何开关。
+最后补一篇同目录 `README.md`：一句话介绍、OAuth 参数表格、特殊设计。
+
+</details>
+
+<details>
+<summary><b>某个系统挂了，会不会导致其它系统也跑不了？</b></summary>
+
+不会。每个系统独立执行、独立记录结果：任一系统抛异常（连接超时、接口 5xx、上游改版等）
+只把该系统标为失败并在汇总里给出原因，随后继续登录下一个系统。
+仅 `Ctrl+C` 会中断整个流程。失败详情也会完整写进 `captures/` 的证据 JSON 供排查。
 
 </details>
 
