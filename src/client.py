@@ -1,11 +1,11 @@
-"""SSO 客户端：封装对 newsso (newsso.shu.edu.cn) 的全部 HTTP 访问。
+"""SSO 客户端：封装对 newsso（newsso.shu.edu.cn）的 HTTP 访问。
 
-提供一次登录后复用 SHU_OAUTH2 会话 Cookie，向多个业务系统分别换取授权的能力。
+只放「所有系统共用」的能力（登录 / 2FA / 授权取码 / 跟随跳转换会话 / 企微扫码），
+系统专属的换会话实现放在 systems/<域名>/client.py，由 `registry.redeem_impl()` 分派。
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import re
 import time
@@ -28,47 +28,8 @@ from . import config
 from .utils import mask, rsa_encrypt_password
 
 
-# --------------------------------------------------------------------------
-# WebVPN 反代主机名还原
-# --------------------------------------------------------------------------
-# WebVPN 会把被代理的外部站点映射成
-#     <scheme>-<主机名中的 . 换成 ->-<端口>.webvpn.shu.edu.cn
-# 例如 newsso.shu.edu.cn:443 → https-newsso-shu-edu-cn-443.webvpn.shu.edu.cn
-# 它的 /api/access/auth/start 返回的 login_url 用的就是这种反代主机。
-# 本 POC 的 SSO 会话（SHU_OAUTH2）是直连 newsso.shu.edu.cn 建立的，
-# 复用该会话就必须把反代主机还原回真实主机。
-_PROXY_HOST_RE = re.compile(
-    r"^(?:https?)-(?P<host>[a-z0-9]+(?:-[a-z0-9]+)*)-(?P<port>\d+)\.webvpn\.shu\.edu\.cn$",
-    re.IGNORECASE,
-)
-
-
-def unproxy_url(url: str, allowed_suffix: str = ".shu.edu.cn") -> str:
-    """把 WebVPN 反代 URL 还原成真实主机 URL；非反代 URL 原样返回。
-
-    仅当还原出的主机以 allowed_suffix 结尾时才改写，避免把带 Cookie 的请求
-    发往意料之外的主机。
-    """
-    if not url:
-        return url
-    p = urlparse(url)
-    m = _PROXY_HOST_RE.match(p.hostname or "")
-    if not m:
-        return url
-    host = m.group("host").replace("-", ".")
-    if not host.endswith(allowed_suffix):
-        return url
-    port = m.group("port")
-    netloc = host if port in ("80", "443") else f"{host}:{port}"
-    return p._replace(netloc=netloc).geturl()
-
-
 class ShuSSO:
-    """上海大学统一身份认证客户端。
-
-    一次登录后，凭借 newsso 域内的 SHU_OAUTH2 会话 Cookie，
-    可向多个业务系统分别换取授权并完成登录。
-    """
+    """上海大学统一身份认证客户端：登录一次，凭 SHU_OAUTH2 会话向各系统换取授权。"""
 
     def __init__(self, tenant: str = config.DEFAULT_TENANT, timeout: int = 30):
         self.sess = requests.Session()
@@ -84,8 +45,8 @@ class ShuSSO:
         self.timeout = timeout
         self.trace: list[dict] = []
 
-    # ---- 记录每一步 ------------------------------------------------
-    def _record(self, step: str, detail: dict) -> None:
+    def record(self, step: str, detail: dict) -> None:
+        """记录一步到 trace（会随证据 JSON 落盘）。系统实现也用这个。"""
         self.trace.append({"step": step, "time": datetime.now().isoformat(), **detail})
 
     # ---- 1. 登录 --------------------------------------------------
@@ -107,7 +68,7 @@ class ShuSSO:
             data = {"message": f"non-json response (HTTP {r.status_code})",
                     "body": r.text[:500]}
 
-        self._record("userLogin", {"http_status": r.status_code, "response": data})
+        self.record("userLogin", {"http_status": r.status_code, "response": data})
         return data
 
     # ---- 2. 两步验证：发码 ----------------------------------------
@@ -118,8 +79,8 @@ class ShuSSO:
             data = r.json()
         except Exception:
             data = {"message": f"non-json (HTTP {r.status_code})", "body": r.text[:300]}
-        self._record("twoStep/send", {"method": method, "http_status": r.status_code,
-                                      "response": data})
+        self.record("twoStep/send", {"method": method, "http_status": r.status_code,
+                                     "response": data})
         return data
 
     # ---- 3. 两步验证：校验 ----------------------------------------
@@ -127,13 +88,14 @@ class ShuSSO:
         body = dict(login_ctx)
         body["code"] = code
         body["method"] = method
-        r = self.sess.post(f"{config.SSO_BASE}/oauth/twoStep/verify", json=body, timeout=self.timeout)
+        r = self.sess.post(f"{config.SSO_BASE}/oauth/twoStep/verify", json=body,
+                           timeout=self.timeout)
         try:
             data = r.json()
         except Exception:
             data = {"message": f"non-json (HTTP {r.status_code})", "body": r.text[:300]}
-        self._record("twoStep/verify", {"method": method, "http_status": r.status_code,
-                                        "response": data})
+        self.record("twoStep/verify", {"method": method, "http_status": r.status_code,
+                                       "response": data})
         return data
 
     # ---- 4. 授权：拿 code ----------------------------------------
@@ -151,7 +113,6 @@ class ShuSSO:
         r = self.sess.get(f"{config.SSO_BASE}/oauth/authorize", params=q,
                           allow_redirects=False, timeout=self.timeout)
         location = r.headers.get("Location", "")
-        needs_login = "/oauth2/login/" in location
         code = None
         if "code=" in location:
             code = parse_qs(urlparse(location).query).get("code", [None])[0]
@@ -168,30 +129,31 @@ class ShuSSO:
             },
             "http_status": r.status_code,
             "location": location,
-            "needs_login": needs_login,
+            # 被踢回登录页 = SSO 会话没复用上
+            "needs_login": "/oauth2/login/" in location,
             "code": code,
         }
-        self._record("authorize", {"client_id": mask(client_id), **result})
+        self.record("authorize", {"client_id": mask(client_id), **result})
         return result
 
-    # ---- 5. 消费 code：完成业务系统登录 ---------------------------
-    def redeem(self, system_key: str, location: str) -> dict:
-        cfg = config.SYSTEMS[system_key]
+    # ---- 5. 通用换会话：跟随 302（或 Refresh 头） ------------------
+    def redeem(self, key: str, cfg: dict, location: str) -> dict:
         r = self.sess.get(location, allow_redirects=True, timeout=self.timeout)
         body = r.text or ""
 
-        # 某些系统（如 OTP）的回调页用 Refresh 头跳转而非 302，
-        # requests 不会自动跟随，这里手动跟进一次。
+        # 部分系统（如 OTP）的回调页用 Refresh 头跳转而非 302，需手动跟进一次
         follow = cfg.get("follow_up_url")
         if follow and cfg["success_url_contains"] not in r.url:
             r2 = self.sess.get(follow, allow_redirects=True, timeout=self.timeout)
-            if cfg["success_url_contains"] in r2.url or cfg["success_body_contains"] in (r2.text or ""):
+            if (cfg["success_url_contains"] in r2.url
+                    or cfg["success_body_contains"] in (r2.text or "")):
                 r, body = r2, (r2.text or "")
 
         ok_url = cfg["success_url_contains"] in r.url
         ok_body = cfg["success_body_contains"] in body
         result = {
-            "system": system_key,
+            "system": key,
+            "detection": cfg.get("detection", "url+body"),
             "final_url": r.url,
             "http_status": r.status_code,
             "url_match": ok_url,
@@ -199,28 +161,21 @@ class ShuSSO:
             "logged_in": bool(ok_url or ok_body),
             "body_preview": body[:400],
         }
-        self._record(f"redeem/{system_key}", result)
+        self.record(f"redeem/{key}", result)
         return result
 
-    # ---- 6. BBS 专用：先取 state ---------------------------------
+    # ---- 6. 向业务系统索要 state（OTP / BBS 用） -------------------
     def bootstrap_state(self, url: str) -> str | None:
         r = self.sess.get(url, allow_redirects=False, timeout=self.timeout)
         loc = r.headers.get("Location", "")
         state = parse_qs(urlparse(loc).query).get("state", [None])[0]
-        self._record("bootstrap_state", {"url": url, "location": loc, "state": state})
+        self.record("bootstrap_state", {"url": url, "location": loc, "state": state})
         return state
 
     # ---- 7. 企业微信：拿到「扫码后打开的确认 URL」 -----------------
-    # 原理：newsso 前端用企微官方 WwLogin SDK 渲染二维码。
-    #       qrConnect 页面直接返回 HTML，其中内嵌 `qrImg?key=<hex>`；
-    #       解码该二维码，其内容就是 `confirm2?k=<同一个key>&notretry=yes`。
-    #       因此无需扫码，仅凭 HTTP 请求即可还原出扫码后 URL。
-    #
-    #       进一步：企微官方 confirm2 页面自身就是靠 scheme 唤起客户端的，
-    #       其内联脚本原文为：
-    #         launchWWByScheme("wxwork://sso/jump?url=" + encodeURIComponent(confirm2_url))
-    #       所以把 confirm2 URL 包进 `wxwork://sso/jump?url=` 即得到
-    #       「一键在企业微信内部打开确认页」的链接。
+    # qrConnect 返回的 HTML 内嵌 qrImg?key=<hex>，而二维码内容正是
+    # confirm2?k=<同一个 key>&notretry=yes（已解码核对），故无需真的扫码即可还原。
+    # 再把 confirm2 包进官方 scheme 前缀，就是「在企微内直接打开」的链接。
     def wecom_qrcode_info(self, state: str = "") -> dict:
         q = {
             "appid": config.WECOM["appid"],
@@ -234,7 +189,6 @@ class ShuSSO:
         r = self.sess.get(config.WECOM["qrcode_base"], params=q, timeout=self.timeout)
         html = r.text or ""
 
-        # 提取 key：qrImg?key=<hex>
         m = re.search(r"qrImg\?key=([0-9a-fA-F]+)", html)
         key = m.group(1) if m else None
 
@@ -245,31 +199,22 @@ class ShuSSO:
             "key": key,
             "qr_img_url": f"{config.WECOM['img_base']}?key={key}" if key else None,
             "confirm_url": confirm_url,
-            # 企业微信客户端内直接打开的 scheme（外部浏览器/短信里点击可拉起企微）
+            # 在企微客户端内直接打开（外部浏览器/短信里点击可拉起企微）
             "wxwork_scheme": (config.WECOM["scheme_jump_base"]
                               + quote(confirm_url, safe="")) if confirm_url else None,
         }
-        self._record("wecom_qrcode", result)
+        self.record("wecom_qrcode", result)
         return result
 
     # ---- 8. 企业微信扫码登录：长轮询等 auth_code --------------------
-    # 原理（用 Chrome DevTools 抓包 + 读 qrConnect 页面 window.settings 确认）：
-    #   qrConnect 页面暴露 longPollGetUrl = /wwopen/sso/l/qrConnect，
-    #   浏览器对它发起 GET 长轮询，返回 JSONP：
-    #     jsonpCallback({"status":"QRCODE_SCAN_NEVER","auth_code":""})
-    #   状态机（实测捕获）：
-    #     QRCODE_SCAN_NEVER  未扫码
-    #     QRCODE_SCAN_ING    已扫、待手机确认
-    #     QRCODE_SCAN_SUCC   已确认 → auth_code 有值
-    #     QRCODE_SCAN_ERR    二维码过期
-    #   拿到 auth_code 后 GET /oauth/wecom/qrcode?code=<auth_code>&state=<paramsBase64>
-    #   即可换取 SHU_OAUTH2 会话。
+    # 轮询地址取自 qrConnect 页面的 window.settings.longPollGetUrl，返回 JSONP：
+    #   jsonpCallback({"status":"QRCODE_SCAN_xxx","auth_code":"..."})
+    # 状态：NEVER 未扫码 → ING 待确认 → SUCC 已确认（auth_code 有值）/ ERR 过期。
     def wecom_wait_scan(self, key: str, state: str = "", timeout: int = 180,
                         poll_log=None) -> dict:
         deadline = time.time() + timeout
         last_status = None
-        # 长轮询属于 open.work.weixin.qq.com，需用该域的 Referer/Origin，
-        # 否则可能被拒（ShuSSO 会话默认头指向 newsso）。
+        # 长轮询属于 open.work.weixin.qq.com，Referer/Origin 必须指到该域
         hdrs = {
             "Referer": config.WECOM["qrcode_base"],
             "Origin": "https://open.work.weixin.qq.com",
@@ -306,220 +251,35 @@ class ShuSSO:
                 last_status = status
 
             if status == "QRCODE_SCAN_SUCC" and data.get("auth_code"):
-                out = {"ok": True, "status": status,
-                       "auth_code": data["auth_code"]}
-                self._record("wecom_wait_scan", out)
+                out = {"ok": True, "status": status, "auth_code": data["auth_code"]}
+                self.record("wecom_wait_scan", out)
                 return out
             if status in ("QRCODE_SCAN_ERR", "QRCODE_SCAN_OVERDUE",
                           "QRCODE_SCAN_CANCEL"):
                 out = {"ok": False, "status": status, "reason": "qrcode_expired_or_cancelled"}
-                self._record("wecom_wait_scan", out)
+                self.record("wecom_wait_scan", out)
                 return out
             if status == "QRCODE_SCAN_ING":
                 time.sleep(0.5)
 
         out = {"ok": False, "status": last_status, "reason": "timeout"}
-        self._record("wecom_wait_scan", out)
+        self.record("wecom_wait_scan", out)
         return out
 
     # ---- 9. 企业微信扫码登录：用 auth_code 换 SSO 会话 -------------
-    # 注意：回调除 code/state 外还**必须带 appid**（DevTools 抓浏览器实际请求确认），
-    #       缺 appid 会返回 {"message":"badRequestParams"}。
+    # 回调除 code/state 外必须带 appid，缺失会返回 {"message":"badRequestParams"}
     def wecom_redeem(self, auth_code: str, state: str) -> dict:
         r = self.sess.get(config.WECOM["redirect_uri"],
                           params={"code": auth_code, "state": state,
                                   "appid": config.WECOM["appid"]},
                           allow_redirects=False, timeout=self.timeout)
         loc = r.headers.get("Location", "") or ""
-        ok = "message=wecomAuthFailed" not in loc and "badRequestParams" not in (r.text or "")
         result = {
-            "ok": ok,
+            "ok": "message=wecomAuthFailed" not in loc and "badRequestParams" not in (r.text or ""),
             "http_status": r.status_code,
             "location": loc,
             "cookies": [c.name for c in self.sess.cookies],
             "body": (r.text or "")[:300],
         }
-        self._record("wecom_redeem", result)
-        return result
-
-    # ======================================================================
-    # WebVPN（webvpn.shu.edu.cn）
-    # ======================================================================
-    # WebVPN 是纯前端 SPA，拿到 code 后不靠 302 换会话，而是调两个私有接口：
-    #   auth/start  -> 取回 newsso 授权地址（并把本次认证登记到服务端）
-    #   auth/finish -> 用 {code, state, deviceId} 换 WebVPN 会话
-    # 下面的方法逐步还原这条链路，抓包依据见 README「WebVPN 访问控制系统」。
-    # ======================================================================
-
-    def _webvpn_headers(self, referer_path: str = "/auth/login",
-                        json_body: bool = False) -> dict:
-        """WebVPN 接口要求同源 Origin/Referer，这里按浏览器实际的发起页面给出。"""
-        base = config.WEBVPN["base"]
-        headers = {
-            "Accept": "application/json, text/plain, */*",
-            "Origin": base,
-            "Referer": f"{base}{referer_path}",
-        }
-        if json_body:
-            headers["Content-Type"] = "application/json"
-        return headers
-
-    # ---- 10. WebVPN：查认证方式 ID（externalId） -------------------
-    def webvpn_external_id(self) -> dict:
-        """查询 WebVPN 的「认证方式」列表，取出 OAuth2 方式的 externalId。
-
-        externalId 是服务端为每个认证方式分配的**固定** ID（非随机），
-        登录链路的 state 就是 base64({"externalId": <它>})。
-        接口异常时回退到实测常量 config.WEBVPN["external_id_fallback"]。
-        """
-        r = self.sess.get(config.WEBVPN["base"] + config.WEBVPN["auth_list"],
-                          params={"type": 0},
-                          headers=self._webvpn_headers(), timeout=self.timeout)
-        found, body = None, None
-        try:
-            body = r.json()
-            for item in (body.get("data") or {}).get("list") or []:
-                if item.get("authType") == config.WEBVPN["auth_type_oauth2"]:
-                    found = item.get("externalId")
-                    break
-        except Exception:
-            body = {"raw": (r.text or "")[:300]}
-
-        external_id = found or config.WEBVPN["external_id_fallback"]
-        result = {
-            "http_status": r.status_code,
-            "external_id": external_id,
-            "source": "api" if found else "fallback",
-            "auth_method_name": next((i.get("name") for i in
-                                      ((body or {}).get("data") or {}).get("list") or []), None),
-        }
-        self._record("webvpn/auth_list", result)
-        return result
-
-    @staticmethod
-    def webvpn_state(external_id: str) -> str:
-        """构造 WebVPN 的 state：**标准 base64（带填充）** 的 {"externalId":...}。
-
-        注意与 b64_params()（base64url 去填充）不同——这里是前端 btoa() 的结果。
-        """
-        raw = json.dumps({"externalId": external_id}, separators=(",", ":"))
-        return base64.b64encode(raw.encode("utf-8")).decode()
-
-    # ---- 11. WebVPN：auth/start（登记认证并取回授权地址） ----------
-    def webvpn_auth_start(self, external_id: str, state: str) -> dict:
-        r = self.sess.post(
-            config.WEBVPN["base"] + config.WEBVPN["auth_start"],
-            json={"externalId": external_id,
-                  "data": json.dumps({"callbackUrl": config.WEBVPN["callback_url"],
-                                      "state": state})},
-            headers=self._webvpn_headers(json_body=True), timeout=self.timeout)
-        try:
-            body = r.json()
-        except Exception:
-            body = {"message": f"non-json (HTTP {r.status_code})",
-                    "raw": (r.text or "")[:300]}
-
-        login_url = ((body.get("data") or {}).get("action") or {}).get("login_url")
-        result = {
-            "http_status": r.status_code,
-            "api_code": body.get("code"),
-            "api_message": body.get("message"),
-            "login_url": login_url,
-            # 反代主机 → 真实主机，只有这样才复用得上直连 newsso 的 SSO 会话
-            "login_url_direct": unproxy_url(login_url) if login_url else None,
-        }
-        self._record("webvpn/auth_start", result)
-        return result
-
-    # ---- 12. WebVPN：auth/finish（用 code 换会话） -----------------
-    def webvpn_finish(self, external_id: str, state: str, code: str,
-                      device_id: str) -> dict:
-        """把 newsso 下发的 code 交给 WebVPN，由服务端去换 token 并建立会话。"""
-        r = self.sess.post(
-            config.WEBVPN["base"] + config.WEBVPN["auth_finish"],
-            json={"externalId": external_id,
-                  "data": json.dumps({"callbackUrl": config.WEBVPN["callback_url"],
-                                      "code": code, "deviceId": device_id,
-                                      "state": state})},
-            headers=self._webvpn_headers("/callback/oauth2", json_body=True), timeout=self.timeout)
-        try:
-            body = r.json()
-        except Exception:
-            body = {"message": f"non-json (HTTP {r.status_code})",
-                    "raw": (r.text or "")[:300]}
-
-        result = {
-            "http_status": r.status_code,
-            "api_code": body.get("code"),          # 0 = 成功（其余如 20000 认证失败）
-            "api_message": body.get("message"),
-            "cookies": [c.name for c in self.sess.cookies],
-        }
-        self._record("webvpn/auth_finish", result)
-        return result
-
-    # ---- 13. WebVPN：user/info（校验登录态） ----------------------
-    def webvpn_user_info(self) -> dict:
-        r = self.sess.get(config.WEBVPN["base"] + config.WEBVPN["user_info"],
-                          headers=self._webvpn_headers(), timeout=self.timeout)
-        try:
-            body = r.json()
-        except Exception:
-            body = {"message": f"non-json (HTTP {r.status_code})",
-                    "raw": (r.text or "")[:300]}
-
-        user = body.get("data") or {}
-        result = {
-            "http_status": r.status_code,
-            "api_code": body.get("code"),          # 未授权时 401
-            "api_message": body.get("message"),
-            "user_id": user.get("userId"),
-            "username": user.get("username"),
-            "nickname": user.get("nickname"),
-            "full_name": user.get("fullName"),
-            # WebVPN 侧的后续要求：需二次验证 / 需改密 / 需绑定本地账号
-            "need_trigger_tfa": user.get("needTriggerTFA"),
-            "need_change_pwd": user.get("needChangePwd"),
-            "need_to_bind_local_account": user.get("needToBindLocalAccount"),
-            "logged_in": bool(user.get("userId")),
-        }
-        self._record("webvpn/user_info", result)
-        return result
-
-    # ---- 14. WebVPN：码换会话（finish + 校验），对齐 redeem() 形状 --
-    def redeem_webvpn(self, system_key: str, code: str, external_id: str,
-                      state: str, device_id: str) -> dict:
-        finish = self.webvpn_finish(external_id, state, code, device_id)
-        info = self.webvpn_user_info()
-        # SPA 站点所有路径都返回同一份 index.html，URL/正文判定无意义，
-        # 因此这里以接口结果为准：finish 返回 code==0 且 user/info 拿到 userId。
-        logged_in = finish.get("api_code") == 0 and info.get("logged_in", False)
-        # WebVPN 可能要求进一步动作（本次 deviceId 被当成新设备时尤其可能）
-        pending = []
-        if info.get("need_trigger_tfa"):
-            pending.append("needTriggerTFA(需二次验证)")
-        if info.get("need_change_pwd"):
-            pending.append("needChangePwd(需改密)")
-        if info.get("need_to_bind_local_account"):
-            pending.append("needToBindLocalAccount(需绑定本地账号)")
-
-        result = {
-            "system": system_key,
-            "detection": "api",                  # 说明：非 URL/正文关键词判定
-            "final_url": config.WEBVPN["landing_url"],
-            "http_status": finish.get("http_status"),
-            "finish_api_code": finish.get("api_code"),
-            "finish_api_message": finish.get("api_message"),
-            "user_id": info.get("user_id"),
-            "username": info.get("username"),
-            "pending_actions": pending,
-            "body_match": None,
-            "url_match": None,
-            "logged_in": bool(logged_in),
-            "body_preview": (f"auth/finish code={finish.get('api_code')} "
-                             f"({finish.get('api_message')}); "
-                             f"user/info code={info.get('api_code')} "
-                             f"userId={info.get('user_id')}"
-                             + (f"; 待处理: {'、'.join(pending)}" if pending else "")),
-        }
-        self._record(f"redeem/{system_key}", result)
+        self.record("wecom_redeem", result)
         return result

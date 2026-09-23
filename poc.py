@@ -1,29 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-上海大学统一身份认证 (newsso.shu.edu.cn) 多系统登录验证 — POC 入口
-================================================================
+"""上海大学统一身份认证（newsso.shu.edu.cn）多系统登录验证 — POC 入口。
 
-目的：用「一次登录」的同一套凭据，向多个业务系统（教务 / OTP / BBS / WebVPN）
-      分别换取授权，验证是否都能登录成功。
+用「一次登录」的同一套 SSO 会话，向多个业务系统分别换取授权并验证登录
+（OAuth 2.0 授权码模式，非 OIDC）。流程说明见 README.md，
+各业务系统的交换配置见 systems/<域名>/config.py。
 
-协议（2026-09-08 实测）：OAuth 2.0 授权码模式 (RFC 6749)，非 OIDC
-* SSO 会话 Cookie: SHU_OAUTH2（HttpOnly, host-scoped）
-* 登录端点: POST /oauth/userLogin {username, password(RSA-PKCS1v15→base64), tenantId, params(base64url)}
-* 2FA 端点: POST /oauth/twoStep/send {method: sms|wecom}；POST /oauth/twoStep/verify {...code, method}
-* 授权端点: GET /oauth/authorize?response_type=code&client_id&redirect_uri&scope&state
-* 结论: 授权码一次性、绑定 state 不可复用；但 SSO 会话 Cookie 在 newsso 域内可复用
-
-外显：控制台按 [OAuth ①/②/③/④] 标注标准授权码流程（①构造授权请求→②用户认证→③下发code→④码换会话）
-
-安全：密码经 getpass 读取，不落盘/不打印；保存的 JSON 自动剔除 password 字段；仅供账号所有者本机验证。
-
-结构：
-    poc.py        CLI 入口（参数解析、模式选择、分发）
-    src/config   协议常量
-    src/utils    工具函数
-    src/client   ShuSSO HTTP 客户端
-    src/flows    高层登录流程
+安全：密码经 getpass 读取，不落盘/不打印；证据 JSON 自动剔除密码与授权码。
 
 用法:
     python poc.py            # 交互式（推荐）
@@ -37,7 +20,9 @@ import argparse
 import sys
 
 from src import config
-from src.flows import banner, choose_login_mode, password_flow, wecom_scan_flow
+from src.entry_password import password_flow
+from src.entry_wecom import wecom_scan_flow
+from src.ui import banner, choose_login_mode
 
 
 def main() -> int:
@@ -59,9 +44,7 @@ def main() -> int:
 
     banner()
 
-    # ---------- 选择登录方式 ----------
     mode = choose_login_mode(args)
-
     if mode == "wecom_scan":
         return wecom_scan_flow(args)
     return password_flow(args)
