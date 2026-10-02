@@ -115,14 +115,14 @@ def patched_systems(mapping: dict):
 # 注册表与配置
 # --------------------------------------------------------------------------
 def test_registry_loads_all_systems():
-    assert list(config.SYSTEMS) == ["bbs", "ds", "jwxt", "otp", "webvpn"], list(config.SYSTEMS)
+    assert list(config.SYSTEMS) == ["bbs", "ds", "jwxt", "otp", "there", "webvpn"], list(config.SYSTEMS)
     for key, cfg in config.SYSTEMS.items():
         for field in ("name", "client_id", "redirect_uri", "scope"):
             assert field in cfg, f"{key} 缺字段 {field}"
 
 
 def test_only_spa_systems_have_impl():
-    for key in ("bbs", "jwxt", "otp"):
+    for key in ("bbs", "jwxt", "otp", "there"):
         assert registry.redeem_impl(key) is None, f"{key} 不该有专属实现"
     for key in ("ds", "webvpn"):
         assert callable(registry.redeem_impl(key)), f"{key} 应提供 redeem(ctx)"

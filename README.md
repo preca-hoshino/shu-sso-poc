@@ -3,7 +3,7 @@
 # SHU SSO POC
 
 上海大学统一身份认证（`newsso.shu.edu.cn`）OAuth 2.0 授权码流程验证工具 ——
-**一次登录，向 jwxt / otp / bbs / webvpn / ds 五个业务系统分别换取授权并验证登录**
+**一次登录，向 jwxt / otp / bbs / webvpn / ds / there 六个业务系统分别换取授权并验证登录**
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Protocol](https://img.shields.io/badge/OAuth%202.0-RFC%206749-informational)](https://datatracker.ietf.org/doc/html/rfc6749)
@@ -136,6 +136,7 @@ GET /oauth/authorize?response_type=code&client_id=...&redirect_uri=...&scope=...
 | `jwxt` | 本科生教务系统 | `Km5t225E8KECKQ6ZDm5K2P6aS2459Cua` | 跟随 `302` | [`systems/jwxt.shu.edu.cn/`](systems/jwxt.shu.edu.cn/README.md) |
 | `otp` | OTP 令牌 | `05Q1L8woQK5350aK1U5o5GKh411ar3h1` | 跟随 `Refresh` 头跳转 | [`systems/otp.shu.edu.cn/`](systems/otp.shu.edu.cn/README.md) |
 | `bbs` | 上大 bbs（乐乎社区） | `vp8G2H42GGE86LP822LHF6Hs7f46483H` | 跟随 `302` | [`systems/bbs.shu.edu.cn/`](systems/bbs.shu.edu.cn/README.md) |
+| `there` | 空间预约管理系统 | `eDrd-M0i0WoSWRxk7ShDC1n-fbS7jRvi` | 跟随 `302` | [`systems/there.shu.edu.cn/`](systems/there.shu.edu.cn/README.md) |
 | `webvpn` | WebVPN 访问控制系统 | `nn7sbb22j2tKE100T024tEp42777p755` | 私有接口两步握手（见 ④） | [`systems/webvpn.shu.edu.cn/`](systems/webvpn.shu.edu.cn/README.md) |
 | `ds` | 千学百科（DeepSeek） | `re0owG1g776ng2eix7x3o8sa20W6OdA2` | 私有接口换 token（见 ④） | [`systems/ds.shu.edu.cn/`](systems/ds.shu.edu.cn/README.md) |
 
@@ -146,6 +147,7 @@ GET /oauth/authorize?response_type=code&client_id=...&redirect_uri=...&scope=...
 | `jwxt` | 授权请求本就不带 `state`，由 POC 生成随机 UUID |
 | `otp` | 需先访问 `https://otp.shu.edu.cn/` 预取 `state`（存于 `ASP.NET_SessionId`），否则回调报「State验证失败」 |
 | `bbs` | 需先访问 `https://bbs.shu.edu.cn/auth/oauth2_basic` 向其索要 `state` |
+| `there` | 授权 URL 可带可不带 `state`（实测服务端**不校验**）；仍先访问 `https://there.shu.edu.cn/login?from=web` 以预置站点会话 |
 | `webvpn` | `state` 为固定结构化值 `base64({"externalId": <认证方式ID>})`，非随机 |
 | `ds` | 授权请求**完全不带 `state` / `scope`**（前端直接拼 URL） |
 
@@ -279,9 +281,9 @@ GET /oauth/authorize?response_type=code&client_id=...&redirect_uri=...&scope=...
                           │  SHU_OAUTH2（host-scoped）    │
                           └───────────────┬──────────────┘
                                           │ 复用同一会话
-        ┌─────────────┬───────────────────┼───────────────┬─────────────┬─────────────┐
-        ▼             ▼                   ▼               ▼             ▼             ▼
-      jwxt          otp                 bbs            webvpn          ds       （可扩展）
+        ┌─────────────┬───────────────────┼───────────────┬─────────────┬─────────────┬─────────┐
+        ▼             ▼                   ▼               ▼             ▼             ▼         ▼
+      jwxt          otp                 bbs            webvpn          ds          there   （可扩展）
 ```
 
 ## 快速开始
@@ -437,6 +439,7 @@ tests/
 | `jwxt` | [`systems/jwxt.shu.edu.cn/`](systems/jwxt.shu.edu.cn/README.md) | 跟随 `302` | URL / 正文关键词 |
 | `otp` | [`systems/otp.shu.edu.cn/`](systems/otp.shu.edu.cn/README.md) | 跟随 `Refresh` 头 | URL / 正文关键词 |
 | `bbs` | [`systems/bbs.shu.edu.cn/`](systems/bbs.shu.edu.cn/README.md) | 跟随 `302` | URL / 正文关键词 |
+| `there` | [`systems/there.shu.edu.cn/`](systems/there.shu.edu.cn/README.md) | 跟随 `302` | URL / 正文关键词 |
 | `webvpn` | [`systems/webvpn.shu.edu.cn/`](systems/webvpn.shu.edu.cn/README.md) | 私有接口握手 | 接口返回码（`detection: api`） |
 | `ds` | [`systems/ds.shu.edu.cn/`](systems/ds.shu.edu.cn/README.md) | 后端接口换 token | 接口返回码（`detection: api`） |
 
