@@ -9,7 +9,7 @@
 systems/
   <系统域名>/          # 例如 ds.shu.edu.cn，与抓包/浏览器地址栏的 Host 一一对应
     config.py          # 必需，导出 SYSTEM 字典（纯数据，不做导入副作用）
-    client.py          # 可选，导出 redeem(ctx) —— 换会话不走「跟随 302」时才需要
+    client.py          # 可选，导出 redeem(ctx) —— 通用路径不适用时才有（多跳链 / 需接口判定）
     README.md          # 建议，系统说明（干什么的 / OAuth 参数 / 特殊设计）
 ```
 
@@ -36,12 +36,12 @@ systems/
 | `detection` | | 判定来源标记：`api` = 只认接口返回；缺省 = URL/正文关键词 |
 | 其余键 | | 系统专用常量，由该系统自己的实现读取（如 webvpn 的 `base` / `auth_start`） |
 
-> 换会话不走「跟随 302」的系统**不要**在这里声明实现名 —— 在同目录放一个
+> 换会话不适用通用路径的系统**不要**在这里声明实现名 —— 在同目录放一个
 > `client.py` 即可，见下节。
 
 ## 换会话实现（`client.py`）
 
-只有换会话不是「跟随 `302`」的系统才有这个文件，约定导出：
+只有通用路径不适用的系统才有这个文件（多跳跨域链、需要接口判定等），约定导出：
 
 ```python
 def redeem(ctx: RedeemContext) -> dict: ...
@@ -73,8 +73,9 @@ def redeem(ctx: RedeemContext) -> dict: ...
 ## 新增一个系统
 
 1. 建 `systems/<域名>/config.py`，导出 `SYSTEM`（`client_id` / `redirect_uri` 抓包即得）；
-2. 若换会话不是「跟随 302」，再在同目录加 `client.py` 导出 `redeem(ctx)`
-   （照 `systems/webvpn.shu.edu.cn/client.py` 与 `systems/ds.shu.edu.cn/client.py` 抄），
+2. 若换会话不适用通用路径（多跳跨域链、只能接口判定等），再在同目录加 `client.py`
+   导出 `redeem(ctx)`（照 `systems/chaoxing.com/client.py`、
+   `systems/webvpn.shu.edu.cn/client.py` 与 `systems/ds.shu.edu.cn/client.py` 抄），
    并可用 `from src.system_api import same_origin_headers, json_or_error` 等辅助件；
 3. 写同目录 `README.md`（介绍 / OAuth 参数 / 特殊设计）；
 4. 在仓库根 `README.md` 的「③ 授权：逐系统换取 code」与「系统交换配置」两处补一行引用。

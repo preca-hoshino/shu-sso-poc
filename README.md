@@ -3,7 +3,7 @@
 # SHU SSO POC
 
 上海大学统一身份认证（`newsso.shu.edu.cn`）OAuth 2.0 授权码流程验证工具 ——
-**一次登录，向 jwxt / otp / bbs / webvpn / ds / there 六个业务系统分别换取授权并验证登录**
+**一次登录，向 jwxt / otp / bbs / webvpn / ds / there / chaoxing 七个业务系统分别换取授权并验证登录**
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Protocol](https://img.shields.io/badge/OAuth%202.0-RFC%206749-informational)](https://datatracker.ietf.org/doc/html/rfc6749)
@@ -32,9 +32,11 @@ flowchart TD
     K --> L{"该系统有 client.py？"}
     L -->|webvpn| M["POST /api/access/auth/finish<br/>GET /api/access/user/info"]
     L -->|ds| P["GET /dsssologin/getSsoUser<br/>看 isSussess 字段"]
+    L -->|chaoxing| Q["逐跳跟随 302 链<br/>座位首页 userLoginInfo"]
     L -->|无| N["跟随 302 / Refresh 头换会话"]
     M --> O["汇总结果<br/>保存脱敏证据 JSON"]
     P --> O
+    Q --> O
     N --> O
 ```
 
@@ -139,6 +141,7 @@ GET /oauth/authorize?response_type=code&client_id=...&redirect_uri=...&scope=...
 | `there` | 空间预约管理系统 | `eDrd-M0i0WoSWRxk7ShDC1n-fbS7jRvi` | 跟随 `302` | [`systems/there.shu.edu.cn/`](systems/there.shu.edu.cn/README.md) |
 | `webvpn` | WebVPN 访问控制系统 | `nn7sbb22j2tKE100T024tEp42777p755` | 私有接口两步握手（见 ④） | [`systems/webvpn.shu.edu.cn/`](systems/webvpn.shu.edu.cn/README.md) |
 | `ds` | 千学百科（DeepSeek） | `re0owG1g776ng2eix7x3o8sa20W6OdA2` | 私有接口换 token（见 ④） | [`systems/ds.shu.edu.cn/`](systems/ds.shu.edu.cn/README.md) |
+| `chaoxing` | 超星（学习通）图书馆座位 | `mK5y895566T96v8Z52z5M3J85K8Miv38` | 跟随 302 链（5read → login6 → chaoxing 域，见 ④） | [`systems/chaoxing.com/`](systems/chaoxing.com/README.md) |
 
 **`state` 策略各不相同**，是全流程最容易踩坑的一环：
 
@@ -150,6 +153,7 @@ GET /oauth/authorize?response_type=code&client_id=...&redirect_uri=...&scope=...
 | `there` | 授权 URL 可带可不带 `state`（实测服务端**不校验**）；仍先访问 `https://there.shu.edu.cn/login?from=web` 以预置站点会话 |
 | `webvpn` | `state` 为固定结构化值 `base64({"externalId": <认证方式ID>})`，非随机 |
 | `ds` | 授权请求**完全不带 `state` / `scope`**（前端直接拼 URL） |
+| `chaoxing` | `scope` / `state` 为空串但**显式发送**（抓包原文；实现自带授权请求以保留空值） |
 
 **Base64 有两种形态，不可混用**：
 
@@ -266,6 +270,34 @@ GET /oauth/authorize?response_type=code&client_id=...&redirect_uri=...&scope=...
 > 逆向材料：`_analysis_bundle/ds/`（已被 `.gitignore` 忽略），
 > `entry-index-*.js` 内含路由守卫与 `getSsoUser` 调用，`login-chunk-*.js` 内含授权 URL 拼接。
 
+**超星（学习通）图书馆座位**：换会话是一条跨域 302 链，成功判定只能靠目标页内嵌数据 ——
+
+```text
+① GET newsso /oauth/authorize?client_id=<chaoxing>&response_type=code&scope=&state=
+       &redirect_uri=https://zhstsg-jx.5read.com/oauthlogin/loginByCodeSchoolid?schoolid=2434&type=xxt
+   （scope / state 是空串但显式携带 —— 浏览器拼 URL 的原文）
+② 302 → zhstsg-jx.5read.com/oauthlogin/loginByCodeSchoolid?code=...   ← 回调不在 *.shu.edu.cn
+③ 302 → passport2-api.chaoxing.com/api/v2/login6?schoolid=35480&...  ← 由它 Set-Cookie 写 chaoxing.com 全域
+④ 302 → 落地 chaoxing 域（p_auth_token 约 30 天）
+⑤ GET office.chaoxing.com/front/third/apps/seat/index?fidEnc=...      ← userLoginInfo 判定登录成功
+```
+
+实测约束：
+
+- **URL / 正文判定无效** —— 目标站是座位 SPA：未登录时首页同样 HTTP 200，只是没有
+  `userLoginInfo`（`detection: "api"`）；
+- **授权请求显式送空 `scope` / `state`** —— 通用 `client.authorize()` 会省略空值，
+  故本系统自带授权请求，逐字对齐抓包；
+- **`login6` 的 `enc` 两次登录完全相同** —— 无需自行计算，随 302 跟随即可；
+- **链跨两个第三方域** —— 实现采用逐跳手动跟随（每跳 `allow_redirects=False`），
+  跳数超限或最终 host 非 `*.chaoxing.com` 时显式失败；
+- **Cookie 留在共享 `client.sess`** —— chaoxing.com 全域会话在同一 CookieJar，
+  下游工具可直接取用。
+
+> 该系统的完整参数与约束：[`systems/chaoxing.com/README.md`](systems/chaoxing.com/README.md)；
+> 配置：[`systems/chaoxing.com/config.py`](systems/chaoxing.com/config.py)、
+> 实现：[`systems/chaoxing.com/client.py`](systems/chaoxing.com/client.py)。
+
 ### 关键结论
 
 1. **授权码一次性、绑定 `state`，不可复用**；
@@ -281,9 +313,9 @@ GET /oauth/authorize?response_type=code&client_id=...&redirect_uri=...&scope=...
                           │  SHU_OAUTH2（host-scoped）    │
                           └───────────────┬──────────────┘
                                           │ 复用同一会话
-        ┌─────────────┬───────────────────┼───────────────┬─────────────┬─────────────┬─────────┐
-        ▼             ▼                   ▼               ▼             ▼             ▼         ▼
-      jwxt          otp                 bbs            webvpn          ds          there   （可扩展）
+        ┌─────────────┬───────────────────┼───────────────┬─────────────┬─────────────┬─────────┬────────────┐
+        ▼             ▼                   ▼               ▼             ▼             ▼         ▼            ▼
+      jwxt          otp                 bbs            webvpn          ds          there    chaoxing   （可扩展）
 ```
 
 ## 快速开始
@@ -422,7 +454,7 @@ src/
 systems/                ★ 可能变动的系统配置与实现，按域名分目录
   README.md             目录约定与 SYSTEM 字段说明
   <域名>/config.py      该系统的 client 信息 / 换会话方式 / 成功判定
-  <域名>/client.py      可选：换会话实现（只有不走「跟随 302」的系统才有）
+  <域名>/client.py      可选：换会话实现（通用路径不适用的系统才有）
   <域名>/README.md      该系统的介绍 / OAuth 参数 / 特殊设计
 tests/
   test_offline.py       离线测试（假会话跑真实代码，不打真实网络）
@@ -442,6 +474,7 @@ tests/
 | `there` | [`systems/there.shu.edu.cn/`](systems/there.shu.edu.cn/README.md) | 跟随 `302` | URL / 正文关键词 |
 | `webvpn` | [`systems/webvpn.shu.edu.cn/`](systems/webvpn.shu.edu.cn/README.md) | 私有接口握手 | 接口返回码（`detection: api`） |
 | `ds` | [`systems/ds.shu.edu.cn/`](systems/ds.shu.edu.cn/README.md) | 后端接口换 token | 接口返回码（`detection: api`） |
+| `chaoxing` | [`systems/chaoxing.com/`](systems/chaoxing.com/README.md) | 跨域 302 链（5read → login6） | 座位页内嵌 `userLoginInfo`（`detection: api`） |
 
 - 目录约定、`SYSTEM` 全部字段、新增系统的步骤：见 [`systems/README.md`](systems/README.md)；
 - 各系统的 README 都按「一句话介绍 → OAuth 参数表格 → 特殊设计」写，
@@ -470,7 +503,7 @@ tests/
 | `ui` | `banner()` `choose_login_mode()` `print_summary()` | 终端呈现 |
 | `qr` | `render_qr_terminal()` | 终端二维码渲染 |
 | `entry_password` / `entry_wecom` | `password_flow()` / `wecom_scan_flow()` | 两种登录入口 |
-| `systems/<域名>/client.py` | `redeem(ctx)` | 该系统专属换会话实现（webvpn / ds） |
+| `systems/<域名>/client.py` | `redeem(ctx)` | 该系统专属换会话实现（chaoxing / webvpn / ds） |
 
 ### RSA 公钥自动更新
 
@@ -504,11 +537,12 @@ pytest tests/                    # 若装了 pytest
 
 | 用例 | 覆盖点 |
 | :--- | :--- |
-| 注册表 | 5 个系统全部装载；`ds` / `webvpn` 有专属实现，其余走通用路径 |
+| 注册表 | 7 个系统全部装载；`chaoxing` / `ds` / `webvpn` 有专属实现，其余走通用路径 |
 | 编码 | `params` 是 base64url 去填充；webvpn 的 `state` 是标准 base64 带填充 |
 | 反代还原 | 仅 `.shu.edu.cn` 结尾的主机才改写（避免带 Cookie 的请求发往意外主机） |
 | 脱敏 | 按键名剔除 + URL 查询串里的 `?code=` |
 | 全链路 | webvpn / ds / 通用系统三条路径都能换到会话，且授权参数各自正确 |
+| 超星链 | 授权显式空 `scope`/`state` → 逐跳 302 → 座位页 `userLoginInfo`；落站外 / 无用户信息 / 跳数超限 / 会话未复用均显式失败 |
 | 早期失败 | 未复用会话 / 未取到 code → 转成 `reason` 而非异常 |
 | 失败隔离 | 单个系统抛异常不影响其余；接口报错如实记录 |
 | 中断语义 | `Ctrl+C`（`KeyboardInterrupt`）仍会终止全局 |
@@ -586,7 +620,7 @@ pytest tests/                    # 若装了 pytest
 <details>
 <summary><b>系统实际登录成功，却被判定为失败？</b></summary>
 
-除 `webvpn`、`ds` 外，其余系统通过 URL / 正文关键词判定成功。
+除 `webvpn`、`ds`、`chaoxing` 外，其余系统通过 URL / 正文关键词判定成功。
 若上游页面改版，请同步更新该系统配置里的
 `success_url_contains` / `success_body_contains` —— 见 [`systems/`](systems/README.md)
 下对应目录的 `config.py` 与 `README.md`。
@@ -598,8 +632,8 @@ pytest tests/                    # 若装了 pytest
 
 通常**不用改 `src/`**：在 [`systems/`](systems/README.md) 下新建 `<系统域名>/config.py`，
 填好 `name` / `client_id` / `redirect_uri` / `scope` 与判定字段即可接入。
-只有当换会话不是「跟随 302」时，才需要在同目录再加一个 `client.py`，导出
-`redeem(ctx)`（照 `webvpn` / `ds` 抄）—— 有它就会被自动识别，无需任何开关。
+只有当换会话不适用通用路径（多跳跨域链、只能接口判定等）时，才需要在同目录再加一个
+`client.py`，导出 `redeem(ctx)`（照 `chaoxing` / `webvpn` / `ds` 抄）—— 有它就会被自动识别，无需任何开关。
 最后补一篇同目录 `README.md`：一句话介绍、OAuth 参数表格、特殊设计。
 
 </details>

@@ -115,21 +115,23 @@ def patched_systems(mapping: dict):
 # 注册表与配置
 # --------------------------------------------------------------------------
 def test_registry_loads_all_systems():
-    assert list(config.SYSTEMS) == ["bbs", "ds", "jwxt", "otp", "there", "webvpn"], list(config.SYSTEMS)
+    assert list(config.SYSTEMS) == ["bbs", "chaoxing", "ds", "jwxt", "otp", "there",
+                                    "webvpn"], list(config.SYSTEMS)
     for key, cfg in config.SYSTEMS.items():
         for field in ("name", "client_id", "redirect_uri", "scope"):
             assert field in cfg, f"{key} 缺字段 {field}"
 
 
-def test_only_spa_systems_have_impl():
+def test_only_special_systems_have_impl():
     for key in ("bbs", "jwxt", "otp", "there"):
         assert registry.redeem_impl(key) is None, f"{key} 不该有专属实现"
-    for key in ("ds", "webvpn"):
+    for key in ("chaoxing", "ds", "webvpn"):
         assert callable(registry.redeem_impl(key)), f"{key} 应提供 redeem(ctx)"
 
 
 def test_system_dirs_mapping():
     dirs = registry.systems_dirs()
+    assert dirs["chaoxing"].name == "chaoxing.com"
     assert dirs["ds"].name == "ds.shu.edu.cn"
     assert dirs["webvpn"].name == "webvpn.shu.edu.cn"
 
@@ -288,6 +290,93 @@ def test_keyboard_interrupt_still_aborts_everything():
         except KeyboardInterrupt:
             return
     raise AssertionError("KeyboardInterrupt 被吞掉了")
+
+
+# --------------------------------------------------------------------------
+# 超星（学习通）：跨域 302 链 + 座位首页 userLoginInfo 判定
+# --------------------------------------------------------------------------
+CX_LANDING = "https://i.chaoxing.com/base"          # 链的落地（任一 *.chaoxing.com）
+CX_CALLBACK = ("https://zhstsg-jx.5read.com/oauthlogin/loginByCodeSchoolid"
+               "?code=TESTCODE&schoolid=2434&type=xxt")
+CX_HTML = ('<script>var userLoginInfo = {"userInfo": '
+           '{"uid": "88001", "uname": "张三", "sno": "20260001"}} || {};</script>')
+
+
+def cx_routes(authorize=None, passport=None, index=None) -> dict:
+    return {
+        "newsso.shu.edu.cn/oauth/authorize":
+            authorize or FakeResponse(status_code=302, location=CX_CALLBACK),
+        "zhstsg-jx.5read.com": FakeResponse(status_code=302, location=(
+            "https://passport2-api.chaoxing.com/api/v2/login6?schoolid=35480&enc=STABLE")),
+        "passport2-api.chaoxing.com":
+            passport or FakeResponse(status_code=302, location=CX_LANDING),
+        "i.chaoxing.com/base": FakeResponse(url=CX_LANDING, text="<html>base</html>"),
+        "office.chaoxing.com":
+            index or FakeResponse(url=("https://office.chaoxing.com/front/third/apps/"
+                                       "seat/index?fidEnc=00bae7f2bdea485a"), text=CX_HTML),
+    }
+
+
+def _run_chaoxing(routes: dict) -> dict:
+    stub = StubClient(routes, [])
+    with patched_systems({"chaoxing": config.SYSTEMS["chaoxing"]}):
+        results = login_all_systems(stub)
+    return results["chaoxing"]
+
+
+def test_chaoxing_success_and_explicit_empty_params():
+    seen = {}
+
+    def capture(url, kw):
+        seen.update(kw)
+        return FakeResponse(status_code=302, location=CX_CALLBACK)
+
+    result = _run_chaoxing(cx_routes(authorize=capture))
+    assert result["logged_in"] is True and result["detection"] == "api"
+    assert result["user_id"] == "88001"
+    assert result["username"] == "20260001"
+    assert result["real_name"] == "张三"
+    # 授权请求逐字对齐浏览器：scope / state 是显式空值（键必须存在，不能缺省省略）
+    params = seen["params"]
+    assert params["scope"] == "" and params["state"] == ""
+    assert params["response_type"] == "code"
+    assert params["client_id"] == config.SYSTEMS["chaoxing"]["client_id"]
+
+
+def test_chaoxing_early_failures():
+    # 会话未复用：授权被踢回登录页
+    r = _run_chaoxing(cx_routes(authorize=FakeResponse(
+        status_code=302, location="https://newsso.shu.edu.cn/oauth2/login/?x=1")))
+    assert r["reason"] == "session_not_reused"
+
+    # 未取得重定向地址：授权返回 200 而非 302
+    r = _run_chaoxing(cx_routes(authorize=FakeResponse(status_code=200, text="<html>")))
+    assert r["reason"] == "no_redirect"
+
+
+def test_chaoxing_chain_cross_host_fails():
+    routes = cx_routes(passport=FakeResponse(status_code=302,
+                                             location="https://evil.example.com/x"))
+    routes["evil.example.com"] = FakeResponse(url="https://evil.example.com/x", text="nope")
+    result = _run_chaoxing(routes)
+    assert result["reason"] == "chain_failed"
+    assert result["final_host"] == "evil.example.com"
+
+
+def test_chaoxing_hop_limit():
+    def loop(url, kw):
+        return FakeResponse(status_code=302,
+                            location="https://passport2-api.chaoxing.com/api/v2/login6?loop=1")
+
+    result = _run_chaoxing(cx_routes(passport=loop))
+    assert result["reason"] == "too_many_redirects"
+
+
+def test_chaoxing_missing_user_info_is_invalid_session():
+    result = _run_chaoxing(cx_routes(index=FakeResponse(
+        url="https://office.chaoxing.com/front/third/apps/seat/index?fidEnc=x",
+        text="<html>请先登录</html>")))
+    assert result["reason"] == "invalid_session"
 
 
 # --------------------------------------------------------------------------

@@ -15,6 +15,9 @@ REASON_TEXT = {
     "no_redirect": "未取得重定向地址",
     "no_code": "未取到授权码",
     "no_external_id": "未取到认证方式 externalId",
+    "chain_failed": "换会话链未落到目标域",
+    "too_many_redirects": "跳转次数超过限制",
+    "invalid_session": "未取得目标站登录态",
     "interrupted": "用户中断",
     "exception": "异常中止",
 }
